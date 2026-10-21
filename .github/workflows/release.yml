@@ -1,0 +1,43 @@
+# Publishes a GitHub release when a version tag (e.g. v1.1.12) is pushed.
+# The release gets the signed package from release/simple_corners.rbz under
+# the fixed name simple_corners.rbz, so the README's "latest" download link
+# always works. Release text: release/NOTES.md.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the package
+        run: |
+          set -e
+          PKG=release/simple_corners.rbz
+          test -f "$PKG"
+          unzip -l "$PKG" | grep -q 'simple_corners/simple_corners.susig' \
+            || { echo "::error::$PKG is not signed"; exit 1; }
+          if unzip -l "$PKG" | grep -qE '\.(rbe|rbs)$'; then
+            echo "::error::$PKG contains encoded Ruby files"; exit 1
+          fi
+          VERSION=$(unzip -p "$PKG" simple_corners.rb | sed -n "s/.*VERSION = '\([0-9.]*\)'.*/\1/p")
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::package version $VERSION does not match tag $GITHUB_REF_NAME"; exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/simple_corners.rbz \
+            --title "Simple Corners $VERSION" \
+            --notes-file release/NOTES.md \
+            --latest

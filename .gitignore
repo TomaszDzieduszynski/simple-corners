@@ -1,0 +1,4 @@
+dist/
+tmp/
+*.obj
+.DS_Store

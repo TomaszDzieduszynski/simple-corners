@@ -1,0 +1,9 @@
+# Lint configuration (gem install rubocop rubocop-sketchup; rubocop src).
+plugins:
+  - rubocop-sketchup
+AllCops:
+  TargetRubyVersion: 2.7
+  NewCops: disable
+  SketchUp:
+    SourcePath: src
+    TargetSketchUpVersion: 2017
