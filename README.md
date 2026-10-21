@@ -29,6 +29,8 @@ restart SketchUp after installing the new one.
 
 ## Tools
 
+![The Simple Corners toolbar: Round Edges, Round Edges Mitred, Bevel Edges, Smooth new surfaces, Smooth / unsmooth, Revert to sharp edge](docs/images/screenshot_tools.png)
+
 | | Tool | What it does |
 |---|---|---|
 | <img src="src/simple_corners/icons/round_24.png" width="24"> | **Round Edges** | Edges become rounded fillets; corners become smooth rounded patches. |
