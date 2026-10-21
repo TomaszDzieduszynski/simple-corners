@@ -28,6 +28,9 @@ the signed package under exactly that file name. The workflow in
    matches the tag, then publishes the release "Simple Corners 1.1.13" with
    `simple_corners.rbz` attached.
 
+   Or, without a tag: on GitHub open *Actions > Release > Run workflow*. The
+   tag is then created from the package version.
+
 If the workflow cannot run, create the release by hand: *Releases > Draft a
 new release*, choose the tag, paste `release/NOTES.md`, and attach
 `release/simple_corners.rbz` (keep that file name).
