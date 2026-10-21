@@ -33,7 +33,6 @@
 
 ## 1.1.6
 
-- Tools renamed to *Round Edges*, *Round Edges, Mitred* and *Bevel Edges*.
 - License: GNU GPL v3 or later.
 - Every command cancels cleanly on unexpected errors; very large jobs ask
   first; the radius search is about 4 times faster.
@@ -71,4 +70,4 @@
 
 ## 1.0
 
-- First version: Round, Mitred and Bevel tools.
+- First version: *Round Edges*, *Round Edges, Mitred* and *Bevel Edges*.
