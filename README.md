@@ -73,12 +73,6 @@ do.
 - **No icon in the Extension Manager** is normal: SketchUp shows icons there
   only for extensions listed on its Extension Warehouse.
 
-## Problems or ideas?
-
-Open an issue on the [Issues page](https://github.com/TomaszDzieduszynski/simple-corner/issues).
-It helps to include your SketchUp version (*Help > About*) and any red text
-from *Extensions > Developer > Ruby Console*.
-
 ## License and credits
 
 Vibecoded by Tomasz "bzqp" Dzieduszyński using Claude Opus 5.5, 2026.
