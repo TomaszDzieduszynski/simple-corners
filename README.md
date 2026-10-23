@@ -1,4 +1,4 @@
-# Simple Corners for SketchUp
+# <img src="docs/images/icon_256.png" width="40" align="top" alt=""> Simple Corners for SketchUp
 
 Round, mitre or bevel the edges of your SketchUp models in one step,
 including tricky corners where three or more edges meet, inner corners and
@@ -82,6 +82,8 @@ do.
   only for extensions listed on its Extension Warehouse.
 
 ## License and credits
+
+<img src="docs/images/bzqp_logo.png" width="64" align="right" alt="bzqp">
 
 Vibecoded by Tomasz "bzqp" Dzieduszyński using Claude Opus 5.5, 2026.
 
