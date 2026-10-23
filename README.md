@@ -83,9 +83,7 @@ do.
 
 ## License and credits
 
-<img src="docs/images/bzqp_logo.png" width="64" align="right" alt="bzqp">
-
-Vibecoded by Tomasz "bzqp" Dzieduszyński using Claude Opus 5.5, 2026.
+<img src="docs/images/bzqp_logo.png" width="40" align="middle" alt="bzqp"> Vibecoded by Tomasz "bzqp" Dzieduszyński using Claude Opus 5.5, 2026.
 
 Free software under the [GNU General Public License v3 or later](LICENSE):
 you may use it for any work, including paid work, and share or change it, as
