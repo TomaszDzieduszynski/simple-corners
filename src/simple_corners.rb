@@ -11,11 +11,15 @@ require 'sketchup.rb'
 require 'extensions.rb'
 
 module SimpleCorners
-  VERSION = '1.1.12'.freeze
+  VERSION = '1.2.1'.freeze
   CREDITS = 'Vibecoded by Tomasz "bzqp" Dzieduszyński using Claude Opus 5.5, 2026'.freeze
 
   unless file_loaded?(__FILE__)
-    loader = File.join(File.dirname(__FILE__).dup.force_encoding('UTF-8'), 'simple_corners', 'main')
+    # __FILE__ has the wrong encoding on Windows with non-English folder
+    # names: copy it and mark it as UTF-8 before using it as a path.
+    file = __FILE__.dup
+    file.force_encoding('UTF-8') if file.respond_to?(:force_encoding)
+    loader = File.join(File.dirname(file), 'simple_corners', 'main')
     ext = SketchupExtension.new('Simple Corners', loader)
     ext.description = 'Round Edges, Round Edges Mitred and Bevel Edges tools: round or ' \
                       "bevel the edges of solids, with smooth or sharp corners. #{CREDITS}. " \

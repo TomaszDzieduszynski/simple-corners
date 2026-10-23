@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.2.1
+
+- *Revert to sharp edge* works on part of a rounded network: select one
+  fillet, or e.g. the top ring of a rounded box while its vertical fillets
+  stay, also with *Round Edges, Mitred*. The whole network is reverted and
+  the edges you did not select are rounded again with their own radius,
+  style, number of segments and smoothing.
+- Selecting one facet of a fillet reverts that whole edge.
+- New surfaces also remember their number of segments and smoothing, so a
+  later partial revert can rebuild them exactly.
+
+## 1.2.0
+
+- *Revert to sharp edge* works on any rounded or bevelled surface:
+  connected fillets, rounded corners, a whole rounded solid, faceted faces
+  (e.g. the sides of a many-sided prism), and several surfaces at once. It
+  works from the geometry, so it also reverts fillets made by other tools.
+  Each surface is checked before the model changes; a surface that is not
+  recognised stays as it is, the others are still reverted.
+
+## 1.1.13
+
+- With several copies of a group selected, every copy is processed (each
+  made unique), not only the first. Components still change all their
+  instances, once.
+- Groups and components nested inside a selected group or component are
+  processed too, at any depth.
+
 ## 1.1.12 (first public release)
 
 - Inside an open group or component on SketchUp 2020 and newer, the hover

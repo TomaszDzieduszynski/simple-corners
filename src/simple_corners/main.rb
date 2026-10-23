@@ -8,11 +8,16 @@
 require 'sketchup.rb'
 
 module SimpleCorners
-  PATH = File.dirname(__FILE__).dup.force_encoding('UTF-8')
+  # __FILE__ has the wrong encoding on Windows with non-English folder
+  # names: copy it and mark it as UTF-8 before using it as a path.
+  file = __FILE__.dup
+  file.force_encoding('UTF-8') if file.respond_to?(:force_encoding)
+  PATH = File.dirname(file).freeze
 
   require File.join(PATH, 'core.rb')
   require File.join(PATH, 'bridge.rb')
   require File.join(PATH, 'tool.rb')
+  require File.join(PATH, 'resharpen.rb')
   require File.join(PATH, 'unround.rb')
 
   MODES = [:round, :sharp, :bevel].freeze
@@ -112,8 +117,14 @@ module SimpleCorners
   end
 
   # What the tools act on: edges of the open context (selected edges and
-  # edges of selected faces) and whole groups/components.
-  Target = Struct.new(:entities, :edges, :transform, :instance)
+  # edges of selected faces) and whole groups/components, including the
+  # groups and components nested in them (nested: true; applying a
+  # selected instance processes its nested ones too).
+  Target = Struct.new(:entities, :edges, :transform, :instance, :nested)
+
+  def self.instance?(e)
+    e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)
+  end
 
   def self.targets(model)
     ctx = context_parent(model)
@@ -125,20 +136,34 @@ module SimpleCorners
         edges[e] = true
       elsif e.is_a?(Sketchup::Face) && e.parent == ctx
         e.edges.each { |x| edges[x] = true }
-      elsif e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)
+      elsif instance?(e)
         insts << e
       end
     end
     list = []
-    list << Target.new(model.active_entities, edges.keys, ctx_tr, nil) unless edges.empty?
+    list << Target.new(model.active_entities, edges.keys, ctx_tr, nil, false) unless edges.empty?
     seen = {}
-    insts.each do |inst|
-      d = inst.definition
-      next if seen[d]
-      seen[d] = true
-      list << Target.new(d.entities, d.entities.grep(Sketchup::Edge), ctx_tr * inst.transformation, inst)
-    end
+    insts.each { |inst| instance_targets(list, inst, ctx_tr, seen, false, 0) }
     list
+  end
+
+  # Adds the targets of an instance and of the instances nested in it.
+  # Copies of a group (Move + Ctrl) share one definition until one is
+  # edited, so every group is a target of its own (it is made unique when
+  # processed). A component definition is shared on purpose: it is
+  # processed once and every instance changes.
+  def self.instance_targets(list, inst, parent_tr, seen, nested, depth)
+    return if depth > Bridge::MAX_DEPTH
+    d = inst.definition
+    unless inst.is_a?(Sketchup::Group)
+      return if seen[d]
+      seen[d] = true
+    end
+    tr = parent_tr * inst.transformation
+    list << Target.new(d.entities, d.entities.grep(Sketchup::Edge), tr, inst, nested)
+    d.entities.each do |e|
+      instance_targets(list, e, tr, seen, true, depth + 1) if instance?(e)
+    end
   end
 
   # Rough number of faces the engine creates (usually within a factor of
@@ -199,6 +224,10 @@ module SimpleCorners
       return res
     end
     list.each_with_index do |t, ti|
+      if t.edges.empty? # a group holding only other groups
+        res[:warm] << nil
+        next
+      end
       base = radius / scale_of(t.transform)
       start = nil
       if warm && warm[ti]
@@ -281,10 +310,12 @@ module SimpleCorners
     op_id = format('%d-%06d', Time.now.to_i, rand(1_000_000))
     model.start_operation(MODE_NAMES[mode], true)
     begin
+      done = {}
       list.each do |t|
+        next if t.nested # processed with the instance that holds it
         opts = Settings.engine_opts(mode, radius / scale_of(t.transform)).merge(:op_id => op_id)
         if t.instance
-          warnings.concat(Bridge.process_instance(t.instance, opts))
+          warnings.concat(Bridge.process_instance(t.instance, opts, done))
         else
           warnings.concat(Bridge.process(t.entities, t.edges, opts))
         end
@@ -410,11 +441,11 @@ module SimpleCorners
     unround_cmd = UI::Command.new('Revert to sharp edge') { Unround.run }
     unround_cmd.small_icon = icon(:unround, 16)
     unround_cmd.large_icon = icon(:unround, 24)
-    unround_cmd.tooltip = 'Revert to sharp edge (experimental, simple cases only)'
-    unround_cmd.status_bar_text = 'Experimental, not perfect: rebuilds the sharp edge of one simple rounded or ' \
-                                  'bevelled edge (select its surface first). Does not work on complex cases ' \
-                                  '(several connected fillets, rounded corners, edited geometry). Check the ' \
-                                  'result; Ctrl+Z undoes it.'
+    unround_cmd.tooltip = 'Revert to sharp edge (experimental)'
+    unround_cmd.status_bar_text = 'Experimental, not perfect: rebuilds the sharp edges and corners under the ' \
+                                  'selected rounded or bevelled surfaces by extending the faces around them ' \
+                                  'until they meet. Select the whole rounded surface (click it). Unusual shapes ' \
+                                  'may be refused. Check the result; Ctrl+Z undoes it.'
 
     menu = UI.menu('Plugins').add_submenu('Simple Corners')
     MODES.each { |m| menu.add_item(cmds[m]) }

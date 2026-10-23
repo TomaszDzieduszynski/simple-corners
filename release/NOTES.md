@@ -1,6 +1,6 @@
 ## Download
 
-**[⬇ simple_corners.rbz](https://github.com/TomaszDzieduszynski/simple-corner/releases/latest/download/simple_corners.rbz)**
+**[⬇ simple_corners.rbz](https://github.com/TomaszDzieduszynski/simple-corners/releases/latest/download/simple_corners.rbz)**
 is the only file you need (it is also listed under *Assets* below). The
 "Source code" files are for developers; you don't need them.
 
@@ -14,16 +14,19 @@ is the only file you need (it is also listed under *Assets* below). The
 Updating from an earlier version: uninstall it first, or restart SketchUp
 after installing.
 
-## What's in this release
+## What's new in 1.2.1
 
-First public release of Simple Corners: *Round Edges*, *Round Edges, Mitred*
-and *Bevel Edges* for SketchUp 2017 or newer, on Windows and Mac. The
-package is signed.
+*Revert to sharp edge* is much more capable (still experimental: check the
+result, Ctrl+Z undoes it). The package is signed.
 
-- Works on complex corners: three or more edges, inner corners, faces with
-  holes.
-- Radius from two clicks or typed, live outline preview, one-step undo.
-- The radius shrinks automatically only where it does not fit.
-- Smooth / unsmooth tools, and an experimental *Revert to sharp edge*.
+- **Any rounded or bevelled surface** can be made sharp again: connected
+  fillets, rounded corners, a whole rounded solid, faceted faces, several
+  surfaces at once, also fillets made by other tools.
+- **Part of a rounded network:** select one fillet, or the top ring of a
+  rounded box. Those edges become sharp; the rest stays rounded with its
+  own radius, style, segments and smoothing (also for *Round Edges,
+  Mitred*).
+- Several copies of a group selected together are all processed, and
+  groups nested inside a selected group are processed too.
 
-Full history: [CHANGELOG.md](https://github.com/TomaszDzieduszynski/simple-corner/blob/main/CHANGELOG.md).
+Full history: [CHANGELOG.md](https://github.com/TomaszDzieduszynski/simple-corners/blob/main/CHANGELOG.md).

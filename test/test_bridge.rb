@@ -167,6 +167,81 @@ class TestBridge < Minitest::Test
     assert_operator g.entities.grep(Sketchup::Face).size, :>, 6
   end
 
+  # Bug report (1.1.12): with several copied groups selected (e.g. sofa
+  # cushions made with Move + Ctrl), only the first copy was rounded: the
+  # copies share one definition and the rest were skipped as duplicates.
+  def test_every_selected_group_copy_is_rounded
+    g = model.entities.add_group
+    build(M.box, g.entities)
+    copies = [g, model.entities.add_group_copy(g), model.entities.add_group_copy(g)]
+    copies.each { |c| model.selection.add(c) }
+    one = SimpleCorners.preview(model, :round, 1.0)[:hard].size
+    assert_operator one, :>, 0
+    assert_equal 3, SimpleCorners.targets(model).size
+    assert SimpleCorners.apply(:round, 1.0, true)
+    copies.each do |c|
+      assert closed?(c.entities)
+      assert_operator c.entities.grep(Sketchup::Face).size, :>, 6
+    end
+    assert_equal 3, copies.map(&:definition).uniq.size
+  end
+
+  # An unselected copy keeps its sharp edges.
+  def test_unselected_group_copy_stays_sharp
+    g = model.entities.add_group
+    build(M.box, g.entities)
+    other = model.entities.add_group_copy(g)
+    model.selection.add(g)
+    assert SimpleCorners.apply(:bevel, 1.0, true)
+    assert_operator g.entities.grep(Sketchup::Face).size, :>, 6
+    assert_equal 6, other.entities.grep(Sketchup::Face).size
+  end
+
+  # Bug report (1.1.13): groups inside a selected group were ignored.
+  # Outer group (no geometry of its own) > two boxes and a group holding a
+  # third box.
+  def test_nested_groups_are_rounded
+    outer = model.entities.add_group
+    a = outer.entities.add_group
+    b = outer.entities.add_group
+    mid = outer.entities.add_group
+    c = mid.entities.add_group
+    [a, b, c].each { |g| build(M.box, g.entities) }
+    model.selection.add(outer)
+    assert_equal 5, SimpleCorners.targets(model).size
+    res = SimpleCorners.preview(model, :round, 1.0)
+    assert_nil res[:error]
+    single = model.entities.add_group
+    build(M.box, single.entities)
+    model.selection.clear
+    model.selection.add(single)
+    one = SimpleCorners.preview(model, :round, 1.0)[:hard].size
+    assert_equal 3 * one, res[:hard].size
+    model.selection.clear
+    model.selection.add(outer)
+    assert SimpleCorners.apply(:round, 1.0, true)
+    [a, b, c].each do |g|
+      assert closed?(g.entities)
+      assert_operator g.entities.grep(Sketchup::Face).size, :>, 6
+    end
+    assert_equal 6, single.entities.grep(Sketchup::Face).size
+  end
+
+  # A group nested in a copied group: only the selected copy changes.
+  def test_nested_group_in_copied_group
+    outer = model.entities.add_group
+    inner = outer.entities.add_group
+    build(M.box, inner.entities)
+    other = model.entities.add_group_copy(outer)
+    model.selection.add(outer)
+    assert SimpleCorners.apply(:bevel, 1.0, true)
+    mine = outer.entities.grep(Sketchup::Group).first
+    theirs = other.entities.grep(Sketchup::Group).first
+    assert_operator mine.entities.grep(Sketchup::Face).size, :>, 6
+    assert closed?(mine.entities)
+    assert_equal 6, theirs.entities.grep(Sketchup::Face).size
+  end
+
   # Bug report (SketchUp 2025): inside an open group everything was drawn
   # shifted by the group's placement. SketchUp reports world coordinates
   # in the open context, so nothing may be transformed again for drawing.
@@ -474,6 +549,7 @@ class TestUnround < Minitest::Test
 
   # Part of a rounded surface (one segment): its neighbouring segments are
   # extended until they meet.
+  # One facet of an unsmoothed fillet selected: the whole edge reverts.
   def test_partial_selection_reverted
     build(M.box)
     e = model.entities.grep(Sketchup::Edge).find { |x| x.start.position.z == 10 && x.end.position.z == 10 && x.start.position.y == 0 && x.end.position.y == 0 }
@@ -484,10 +560,10 @@ class TestUnround < Minitest::Test
     strip = new_surface(BOX_PLANES)
     model.selection.clear
     model.selection.add(strip[strip.size / 2]) # one segment only
-    n = faces.size
     assert SimpleCorners::Unround.run, UI.messages.last
-    assert_equal n - 1, faces.size
+    assert_equal 6, faces.size
     assert closed?
+    assert_in_delta 1000.0, volume, 1e-6
   end
 
   # Faces of the strip along the top-front edge (y = 0, z = 10), between
@@ -549,17 +625,107 @@ class TestUnround < Minitest::Test
     assert sharp_edge_restored?(0.0, 10.0)
   end
 
-  def test_complex_surface_not_recognised
-    build(M.box)
-    model.selection.add(faces)
-    assert SimpleCorners.apply(:round, 2.0)
-    n = faces.size
-    model.selection.clear
-    model.selection.add(new_surface(BOX_PLANES)) # all 12 fillets + 8 corners
-    refute SimpleCorners::Unround.run
-    assert_match(/not recognised/, UI.messages.last)
-    assert_equal n, faces.size
+  # A whole rounded / mitred / bevelled box (12 strips and 8 corners) is
+  # one surface: all of it goes back to the box, in one undo step.
+  def test_whole_rounded_box_reverted
+    [:round, :sharp, :bevel].each do |mode|
+      setup
+      build(M.box)
+      model.selection.add(faces)
+      assert SimpleCorners.apply(mode, 2.0)
+      model.selection.clear
+      model.selection.add(new_surface(BOX_PLANES))
+      model.ops.clear
+      assert SimpleCorners::Unround.run, "#{mode}: #{UI.messages.inspect}"
+      assert_equal 6, faces.size, mode.to_s
+      assert_equal 12, model.entities.grep(Sketchup::Edge).size, mode.to_s
+      assert closed?
+      assert_in_delta 1000.0, volume, 1e-6
+      assert_equal [[:start, 'Revert to Sharp Edge'], [:commit]], model.ops
+    end
   end
+
+  # Several rounded edges selected together: one alone (a strip) and two
+  # meeting at a corner (a small network).
+  def test_several_separate_edges_reverted
+    build(M.box)
+    es = model.entities.grep(Sketchup::Edge).select do |e|
+      ps = [e.start.position, e.end.position]
+      ps.all? { |q| q.z == 10 && q.y == 0 } || ps.all? { |q| q.z == 0 && q.y == 10 } || ps.all? { |q| q.x == 10 && q.y == 10 }
+    end
+    assert_equal 3, es.size
+    model.selection.add(es)
+    assert SimpleCorners.apply(:round, 2.0)
+    model.selection.clear
+    model.selection.add(new_surface(BOX_PLANES))
+    assert_equal 2, SimpleCorners::Unround.surfaces(model.selection.to_a).size
+    assert SimpleCorners::Unround.run, UI.messages.inspect
+    assert_equal 6, faces.size
+    assert closed?
+    assert_in_delta 1000.0, volume, 1e-6
+  end
+
+  # A surface that is not recognised stays; the others are reverted.
+  def test_unrecognised_surface_stays
+    build(M.box)
+    e = model.entities.grep(Sketchup::Edge).find { |x| [x.start, x.end].all? { |v| v.position.z == 10 && v.position.y == 0 } }
+    model.selection.add(e)
+    assert SimpleCorners.apply(:round, 2.0)
+    strip = new_surface(BOX_PLANES)
+    bottom = faces.find { |f| f.vertices.all? { |v| v.position.z == 0 } }
+    model.selection.clear
+    model.selection.add(strip)
+    model.selection.add(bottom)
+    assert SimpleCorners::Unround.run
+    assert_match(/1 of 2 surfaces reverted/, UI.messages.last)
+    assert_equal 6, faces.size
+    assert closed?
+    assert_in_delta 1000.0, volume, 1e-6
+  end
+
+  # Nothing recognised: no change, nothing left open.
+  def test_nothing_recognised
+    build(M.box)
+    model.selection.add(faces.find { |f| f.vertices.all? { |v| v.position.z == 0 } })
+    refute SimpleCorners::Unround.run
+    assert_match(/does not belong|not recognised/, UI.messages.last)
+    assert_equal 6, faces.size
+    assert_equal [:abort], model.ops.last
+  end
+
+  def test_lshape_all_edges_reverted
+    build(M.lshape)
+    model.selection.add(faces)
+    assert SimpleCorners.apply(:round, 1.5)
+    l_planes = [[[0, 0, 1], 10], [[0, 0, -1], 0], [[0, -1, 0], 0], [[1, 0, 0], 20], [[0, 1, 0], 8], [[1, 0, 0], 8], [[0, 1, 0], 20], [[-1, 0, 0], 0]]
+    model.selection.clear
+    model.selection.add(new_surface(l_planes))
+    assert SimpleCorners::Unround.run, UI.messages.inspect
+    assert_equal 8, faces.size
+    assert closed?
+    assert_in_delta 20 * 20 * 10 - 12 * 12 * 10, volume, 1e-6
+  end
+
+  # A faceted cylinder with smoothed sides and a rounded top rim: the
+  # facets meet the top again and their edges stay smooth.
+  def test_cylinder_rim_reverted_sides_stay_smooth
+    build(M.cylinder(12, 10, 10))
+    vertical = lambda do
+      model.entities.grep(Sketchup::Edge).select { |x| (x.start.position.z - x.end.position.z).abs > 1e-9 }
+    end
+    vertical.call.each { |x| x.soft = true; x.smooth = true }
+    rim = model.entities.grep(Sketchup::Edge).select { |x| [x.start, x.end].all? { |v| v.position.z == 10 } }
+    model.selection.add(rim)
+    assert SimpleCorners.apply(:round, 2.0)
+    model.selection.clear
+    model.selection.add(tagged_faces)
+    assert SimpleCorners::Unround.run, UI.messages.inspect
+    assert_equal 14, faces.size
+    assert closed?
+    assert_equal 12, vertical.call.size
+    assert(vertical.call.all? { |x| x.soft? && x.smooth? && (x.start.position.z - x.end.position.z).abs > 9.999 })
+  end
+
   def tagged_faces
     faces.select { |f| f.get_attribute(SimpleCorners::Bridge::DICT, 'op') }
   end
@@ -603,7 +769,7 @@ class TestUnround < Minitest::Test
     end
   end
 
-  # One facet of an unsmoothed fillet on the same prism.
+  # One facet of an unsmoothed fillet on the same prism: the edge reverts.
   def test_shallow_corner_facet_reverted
     build(M.cylinder(12, 10, 10))
     e = model.entities.grep(Sketchup::Edge).find { |x| [x.start, x.end].all? { |v| (v.position.x - 10).abs < 1e-9 && v.position.y.abs < 1e-9 } }
@@ -613,11 +779,111 @@ class TestUnround < Minitest::Test
     SimpleCorners::Settings.smooth = true
     strip = tagged_faces.sort_by { |f| Math.atan2(f.vertices[0].position.y, f.vertices[0].position.x) }
     model.selection.clear
+    n = 14
     model.selection.add(strip[strip.size / 2])
-    n = faces.size
     assert SimpleCorners::Unround.run, UI.messages.last
-    assert_equal n - 1, faces.size
+    assert_equal n, faces.size
     assert closed?
+  end
+
+  # --- part of a rounded network: the rest stays rounded ----------------
+
+  # Box edges as point pairs.
+  def box_edges
+    m = M.box
+    M.edges(m).map { |a, b| [m.points[a], m.points[b]] }
+  end
+
+  def seg_dist(p, a, b)
+    v = M::V
+    ab = v.sub(b, a)
+    t = [[v.dot(v.sub(p, a), ab) / v.dot(ab, ab), 0.0].max, 1.0].min
+    v.dist(p, v.add(a, v.mul(ab, t)))
+  end
+
+  # New faces nearest to the given box edges (what belongs to their
+  # rounding).
+  def faces_of(edges)
+    all = box_edges
+    tagged_faces.select do |f|
+      c = M::V.avg(f.vertices.map { |x| x.position.to_a })
+      best = all.min_by { |a, b| seg_dist(c, a, b) }
+      edges.include?(best)
+    end
+  end
+
+  # What a click selects: faces connected by soft edges.
+  def click(face)
+    seen = { face => true }
+    todo = [face]
+    until todo.empty?
+      f = todo.pop
+      f.edges.each { |e| e.faces.each { |g| (seen[g] = true; todo << g) if e.soft? && !seen[g] } }
+    end
+    seen.keys
+  end
+
+  def box_rounded(mode, edges, r = 2.0)
+    setup
+    build(M.box)
+    sel = model.entities.grep(Sketchup::Edge).select do |e|
+      edges.any? { |a, b| [a, b].sort == [e.start.position.to_a, e.end.position.to_a].sort }
+    end
+    model.selection.add(sel)
+    assert SimpleCorners.apply(mode, r)
+    model.selection.clear
+    [faces.size, volume]
+  end
+
+  TOP_FRONT = [[0.0, 0.0, 10.0], [10.0, 0.0, 10.0]].freeze
+
+  # The bug report: on a mitred box, one fillet clicked and reverted. That
+  # edge is sharp again, the other 11 stay as they were: the same as
+  # rounding only those 11.
+  def test_one_edge_of_a_network_reverted
+    [:sharp, :round, :bevel].each do |mode|
+      rest = box_edges.reject { |e| e.sort == TOP_FRONT.sort }
+      want = box_rounded(mode, rest)
+      box_rounded(mode, box_edges)
+      strip = faces_of([box_edges.find { |e| e.sort == TOP_FRONT.sort }])
+      refute_empty strip
+      # a click on the fillet (round mode: one click selects the whole
+      # smooth network, so its strip is selected face by face)
+      model.selection.add(mode == :round ? strip : click(strip.max_by(&:area)))
+      assert SimpleCorners::Unround.run, "#{mode}: #{UI.messages.inspect}"
+      assert closed?, mode.to_s
+      assert_equal want[0], faces.size, mode.to_s
+      assert_in_delta want[1], volume, 1e-6, mode.to_s
+      assert sharp_edge_restored?(0.0, 10.0), mode.to_s
+    end
+  end
+
+  # The 4 top fillets of a mitred box reverted: the vertical and bottom
+  # edges stay rounded (as if only those 8 were rounded).
+  def test_top_ring_of_a_network_reverted
+    [:sharp, :round, :bevel].each do |mode|
+      top = box_edges.select { |a, b| a[2] == 10 && b[2] == 10 }
+      want = box_rounded(mode, box_edges - top)
+      box_rounded(mode, box_edges)
+      model.selection.add(faces_of(top))
+      assert SimpleCorners::Unround.run, "#{mode}: #{UI.messages.inspect}"
+      assert closed?, mode.to_s
+      assert_equal want[0], faces.size, mode.to_s
+      assert_in_delta want[1], volume, 1e-6, mode.to_s
+    end
+  end
+
+  # Mostly unselected edges stay rounded; an edge counts as selected when
+  # at least half of its faces are.
+  def test_majority_decides
+    want = box_rounded(:sharp, box_edges.reject { |e| e.sort == TOP_FRONT.sort })
+    box_rounded(:sharp, box_edges)
+    strip = faces_of([box_edges.find { |e| e.sort == TOP_FRONT.sort }])
+    model.selection.add(strip)
+    model.selection.add(faces_of([box_edges.find { |a, b| a[2] == 0 && b[2] == 0 }]).first(1))
+    assert SimpleCorners::Unround.run, UI.messages.inspect
+    assert_equal want[0], faces.size
+    assert_in_delta want[1], volume, 1e-6
   end
 
   def test_unexpected_error_is_reported

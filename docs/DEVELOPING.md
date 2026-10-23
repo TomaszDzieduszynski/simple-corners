@@ -10,7 +10,9 @@ src/simple_corners.rb             extension loader (registers "Simple Corners")
 src/simple_corners/main.rb        menus, toolbar, context menu, settings, apply command
 src/simple_corners/tool.rb        interactive tool (picking, preview, Measurements box)
 src/simple_corners/bridge.rb      reads SketchUp geometry, rebuilds faces, edge properties
-src/simple_corners/unround.rb     revert a simple rounded/bevelled edge to a sharp edge
+src/simple_corners/unround.rb     Revert to sharp edge command (SketchUp side; single-strip
+                                  method; partial revert of a rounded network)
+src/simple_corners/resharpen.rb   revert engine: rebuilds sharp edges/corners (pure Ruby)
 src/simple_corners/core.rb        geometry engine (pure Ruby, no SketchUp API)
 src/simple_corners/icons/         toolbar icons and cursors: SVG (Windows) and PDF (macOS)
                                   for SketchUp 2016+, PNG for older versions
@@ -19,7 +21,8 @@ release/simple_corners.rbz        the signed package of the current release
 release/NOTES.md                  text of the current GitHub release
 test/                             engine tests, mock SketchUp API, SketchUp-side tests
 test/dev/                         quality scripts (stress, folds, dents, dome, convexity,
-                                  fuzz = random crash hunt)
+                                  fuzz = random crash hunt, fuzz_revert / fuzz_revert_mock =
+                                  revert round trips, fuzz_partial_mock = partial revert)
 scripts/build_rbz.sh              builds dist/simple_corners_v<version>.rbz from src/
 scripts/check_ruby22.rb           checks Ruby 2.2 (SketchUp 2017) compatibility
 scripts/preview_case.rb           runs a test solid and writes an OBJ
@@ -34,8 +37,12 @@ scripts/make_png_icons.py         draws the PNG icons (needs Pillow)
 
 ```sh
 ruby test/test_core.rb        # engine: closed meshes, planarity, volumes, random prisms
-ruby test/test_bridge.rb      # loader, tool and bridge on a mock SketchUp API
+ruby test/test_resharpen.rb   # revert engine: round, mitre or bevel, revert, compare with original
+ruby test/test_bridge.rb      # loader, tool, bridge and revert on a mock SketchUp API
 ruby test/dev/fuzz.rb 300     # crash hunt: random solids, inputs and tool events (slow)
+SEED=1 ruby test/dev/fuzz_revert.rb 300       # revert engine round trips on random solids
+SEED=1 ruby test/dev/fuzz_revert_mock.rb 200  # the whole revert command on the mock API
+SEED=1 ruby test/dev/fuzz_partial_mock.rb 300 # revert part of a network vs. rounding only the rest
 gem install parser && ruby scripts/check_ruby22.rb
 sh scripts/build_rbz.sh       # -> dist/simple_corners_v<version>.rbz (unsigned)
 ```
@@ -101,6 +108,38 @@ stay inside their original faces (within 2% of the radius where different
 radii meet) and stay convex. Neighbouring triangles of a patch must not fold
 (angle under 45°). The rounded cube converges to the exact volume.
 
+## How Revert to sharp edge works
+
+Each selected surface (grown across soft edges) is handled on its own, all
+in one undo step; selected pieces of one rounded network are handled
+together. In this order:
+
+1. **Part of a rounded network** (`Unround.prepare_partial`): the network
+   is the selection grown across soft edges and into faces tagged with the
+   same operation. The whole network is reverted with the revert engine,
+   then the edges whose rounding was mostly not selected (by area) are
+   rounded again with `Bridge.process` and `:edge_offsets`: the stored
+   radius unless the geometry shows it was reduced, and the stored (else
+   measured) mode, segments and smoothing.
+2. **Any surface** (`resharpen.rb`, pure Ruby): each face of the surface is
+   given to the neighbouring face it came from (grown inwards from the
+   outline, to the reachable neighbour whose direction is closest). Each
+   neighbour's new outline is its old outline plus its area of the surface;
+   where two areas touch, their planes meet in a sharp edge, where three
+   meet, in a corner (points where 4-8 faces meet are split back into
+   3-face corners). Checks: every face flat, not crossing itself, not
+   turned over; every edge between exactly two faces; corners near the
+   surface.
+3. **Otherwise, part of a smooth surface:** the single-strip method. The
+   two flat side faces are extended until they meet; each end extends a
+   flat end face or gets a small flat cap.
+
+Round trips (round/mitre/bevel, then revert, compare with the original) on
+about 3,000 random solids came back exactly or were refused (0.2%); none
+came back wrong. Note for the mock fuzzers: the mock API does not merge
+points closer than SketchUp's 0.001" tolerance, so results that are closed
+only after such a merge are counted as skipped.
+
 ## SketchUp API notes
 
 - Inside an open group or component, SketchUp reports and expects world
@@ -109,4 +148,6 @@ radii meet) and stay convex. Neighbouring triangles of a patch must not fold
 - Since SketchUp 2025, mouse coordinates are floats in logical pixels; the
   tool passes them through unchanged.
 - Faces created by the tools carry an attribute dictionary `SimpleCorners`
-  (`op` = operation id, `mode`, `radius`).
+  (`op` = operation id, `mode`, `radius`, and since 1.2.1 `segments`,
+  `smooth`). *Revert to sharp edge* uses them to find a rounded network and
+  to round its other edges again as they were.

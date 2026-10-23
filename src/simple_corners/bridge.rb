@@ -46,6 +46,19 @@ module SimpleCorners
           :normal => f.normal.to_a }
       end
       sel = edges.map { |e| [vid.call(e.start), vid.call(e.end)] }
+      # Given radius per edge ({Sketchup::Edge => offset}, e.g. rounding
+      # edges again as they were): used as is, only reduced if needed.
+      if opts[:edge_offsets]
+        start = {}
+        edges.each do |e|
+          d = opts[:edge_offsets][e]
+          next unless d
+          a = vid.call(e.start)
+          b = vid.call(e.end)
+          start[a < b ? [a, b] : [b, a]] = d
+        end
+        opts = opts.merge(:start_offsets => start, :refine => false)
+      end
 
       fmt = lambda { |x| Sketchup.format_length(x) }
       # Fits the radius: smaller only at the corners where it does not fit.
@@ -69,14 +82,32 @@ module SimpleCorners
       warnings
     end
 
-    # Processes all edges of a group or component instance. Component
-    # definitions are shared: every instance of it changes.
-    def self.process_instance(inst, opts)
-      if inst.is_a?(Sketchup::Group) && inst.definition.instances.size > 1
-        inst.make_unique
+    # Deepest nesting of groups/components that is processed.
+    MAX_DEPTH = 32
+
+    # Processes all edges of a group or component instance, and of the
+    # groups and components nested in it. A group that shares its
+    # definition with copies is made unique first, so only this copy
+    # changes. Component definitions are shared on purpose: each is
+    # processed once (done: definitions already processed) and every
+    # instance of it changes.
+    def self.process_instance(inst, opts, done = {}, depth = 0)
+      return [] if depth > MAX_DEPTH
+      if inst.is_a?(Sketchup::Group)
+        inst.make_unique if inst.definition.instances.size > 1
+      else
+        return [] if done[inst.definition]
       end
-      ents = inst.definition.entities
-      process(ents, ents.grep(Sketchup::Edge), opts)
+      d = inst.definition
+      done[d] = true
+      ents = d.entities
+      warnings = process(ents, ents.grep(Sketchup::Edge), opts)
+      nested = ents.to_a.select { |e| e.valid? && (e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)) }
+      nested.each do |e|
+        sub = opts.merge(:offset => opts[:offset] / SimpleCorners.scale_of(e.transformation))
+        warnings.concat(process_instance(e, sub, done, depth + 1))
+      end
+      warnings
     end
 
     # Attribute dictionary on the faces this extension creates (op id, mode,
@@ -138,6 +169,8 @@ module SimpleCorners
           f.set_attribute(DICT, 'op', opts[:op_id])
           f.set_attribute(DICT, 'mode', opts[:mode].to_s)
           f.set_attribute(DICT, 'radius', opts[:offset].to_f)
+          f.set_attribute(DICT, 'segments', opts[:segments].to_i) if opts[:segments]
+          f.set_attribute(DICT, 'smooth', opts[:smooth] != false)
         end
         created << f
       end

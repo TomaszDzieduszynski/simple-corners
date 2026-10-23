@@ -328,6 +328,10 @@ module Sketchup
     def smooth?
       @smooth ? true : false
     end
+
+    def erase!
+      @parent.entities.erase_entities([self])
+    end
   end
 
   class Loop
@@ -369,6 +373,19 @@ module Sketchup
 
     def vertices
       @vs
+    end
+
+    def area
+      n = [0.0, 0.0, 0.0]
+      k = @vs.size
+      k.times do |i|
+        a = @vs[i].position
+        b = @vs[(i + 1) % k].position
+        n[0] += (a.y - b.y) * (a.z + b.z)
+        n[1] += (a.z - b.z) * (a.x + b.x)
+        n[2] += (a.x - b.x) * (a.y + b.y)
+      end
+      Math.sqrt(n[0]**2 + n[1]**2 + n[2]**2) / 2
     end
 
     def outer_loop
@@ -563,8 +580,8 @@ module Sketchup
   class Group < Drawingelement
     attr_reader :definition
 
-    def initialize
-      @definition = ComponentDefinition.new
+    def initialize(definition = nil)
+      @definition = definition || ComponentDefinition.new
       @definition.instances << self
     end
 
@@ -580,7 +597,17 @@ module Sketchup
       Geom::BoundingBox.new
     end
 
+    # Like SketchUp: a group sharing its definition with copies gets its
+    # own copy of the geometry.
     def make_unique
+      return self if @definition.instances.size <= 1
+      old = @definition
+      old.instances.delete(self)
+      @definition = ComponentDefinition.new
+      @definition.instances << self
+      old.entities.grep(Face).each { |f| @definition.entities.add_face(f.vertices.map(&:position)) }
+      # nested groups are copied as instances of the same definitions
+      old.entities.grep(Group).each { |g| @definition.entities.add_group_copy(g) }
       self
     end
   end
@@ -590,6 +617,14 @@ module Sketchup
   class Entities
     def add_group
       g = Group.new
+      @items << g
+      g
+    end
+
+    # Test helper (not SketchUp API): a copy of a group as Move + Ctrl
+    # makes it, sharing the definition until one of them is edited.
+    def add_group_copy(group)
+      g = Group.new(group.definition)
       @items << g
       g
     end

@@ -4,9 +4,9 @@ Round, mitre or bevel the edges of your SketchUp models in one step,
 including tricky corners where three or more edges meet, inner corners and
 faces with holes.
 
-## [⬇ Download Simple Corners (simple_corners.rbz)](https://github.com/TomaszDzieduszynski/simple-corner/releases/latest/download/simple_corners.rbz)
+## [⬇ Download Simple Corners (simple_corners.rbz)](https://github.com/TomaszDzieduszynski/simple-corners/releases/latest/download/simple_corners.rbz)
 
-Version 1.1.12 · SketchUp 2017 or newer · Windows and Mac · free and open
+Version 1.2.1 · SketchUp 2017 or newer · Windows and Mac · free and open
 source · signed by SketchUp's extension signing service
 
 ![The three tools on the same L-shaped block](docs/images/tools.png)
@@ -38,7 +38,7 @@ restart SketchUp after installing the new one.
 | <img src="src/simple_corners/icons/bevel_24.png" width="24"> | **Bevel Edges** | Edges become flat chamfers; corners become flat facets. |
 | <img src="src/simple_corners/icons/smooth_new_24.png" width="24"> | **Smooth new surfaces** | On/off switch (on by default): new rounded surfaces get smooth, hidden segment lines. |
 | <img src="src/simple_corners/icons/smooth_sel_24.png" width="24"> | **Smooth / unsmooth selection** | Smooths the edges between the selected faces, or unsmooths them if they are already smooth. |
-| <img src="src/simple_corners/icons/unround_24.png" width="24"> | **Revert to sharp edge** | *Experimental, simple cases only.* Turns one selected rounded or bevelled edge back into a sharp edge. |
+| <img src="src/simple_corners/icons/unround_24.png" width="24"> | **Revert to sharp edge** | *Experimental.* Turns the selected rounded or bevelled surfaces back into sharp edges and corners; the rest of a rounded network stays rounded. |
 
 ## How to use
 
@@ -67,6 +67,12 @@ do.
 - **Groups and components:** select them and the whole object is processed.
   All copies of a component change together, because they share one
   definition.
+- **Revert to sharp edge:** click a rounded or bevelled surface (one click
+  selects a whole smooth surface; Shift+click adds more) and press the
+  button. Select a whole rounded solid to make it sharp again, or only some
+  fillets: those edges become sharp and the rest stays rounded as it was.
+  It is experimental, so check the result (Ctrl+Z undoes it). A surface it
+  does not recognise is left unchanged, with a message.
 - **Very small models:** SketchUp cannot make edges shorter than about
   0.001". If a tiny radius fails, scale the model up (x10 or x100), apply,
   then scale it back down.
