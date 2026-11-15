@@ -886,6 +886,158 @@ class TestUnround < Minitest::Test
     assert_in_delta want[1], volume, 1e-6
   end
 
+  # Builds a fixture (part of a real model) in the mock model; returns
+  # [faces, fixture]. Faces with holes come first, so a face lying inside
+  # a hole does not get in the way.
+  def build_fixture(name)
+    d = eval(File.read(File.expand_path("fixtures/#{name}.rb", __dir__)))
+    ents = model.entities
+    gp = lambda { |i| Geom::Point3d.new(*d[:points][i]) }
+    out = []
+    (0...d[:faces].size).sort_by { |i| -d[:faces][i][:loops].size }.each do |i|
+      fd = d[:faces][i]
+      f = ents.add_face(fd[:loops][0].map(&gp))
+      f.inside = nil
+      f.reverse! if f.normal.dot(Geom::Vector3d.new(*fd[:normal])) < 0
+      fd[:loops][1..-1].each do |lp|
+        h = ents.add_face(lp.map(&gp))
+        h.inside = f
+        h.erase!
+      end
+      out[i] = f
+    end
+    d[:soft].each do |a, b|
+      e = ents.vertex_at(gp.call(a)).common_edge(ents.vertex_at(gp.call(b)))
+      e.soft = e.smooth = true if e
+    end
+    [out, d]
+  end
+
+  def pt(x, y, z)
+    Geom::Point3d.new(x, y, z)
+  end
+
+  def face_with_point?(x, y, z, size = nil)
+    faces.any? do |f|
+      (size.nil? || f.outer_loop.vertices.size == size) &&
+        f.outer_loop.vertices.any? { |v| v.position.distance(pt(x, y, z)) < 1e-3 }
+    end
+  end
+
+  def wall_face
+    faces.select { |f| f.normal.x.abs > 0.999 && (f.vertices[0].position.x - 34.251969).abs < 1e-3 }.max_by(&:area)
+  end
+
+  # An arc drawn by hand in a doorway (tangent to the jamb only), ending
+  # on a wall face that is divided right at the arc's end: a face left
+  # inside the wall's door hole shares the hole's edge. The jamb and the
+  # step are extended to a sharp edge; that face becomes a rectangle and
+  # the wall keeps its holes.
+  def test_revert_arc_ending_on_a_divided_wall
+    fs, d = build_fixture('doorway')
+    count = faces.size
+    d[:faces].each_with_index { |fd, i| model.selection.add(fs[i]) if fd[:sel] }
+    assert SimpleCorners::Unround.run, UI.messages.inspect
+    assert_empty UI.messages
+    assert_equal count - 12, faces.size
+    corner = [71.574803, 63.424743]
+    assert face_with_point?(34.251969, *corner, 4), 'face in the door hole: now a rectangle'
+    assert face_with_point?(24.803150, *corner, 4), 'step extended to the jamb'
+    assert_equal 4, wall_face.loops.size, 'the wall keeps its holes'
+    refute(faces.any? { |f| f.vertices.any? { |v| v.position.distance(pt(34.251969, 73.593647, 74.786535)) < 1e-3 } }, 'arc gone')
+  end
+
+  # Rounding an edge that ends on a face with holes, where another face
+  # already lies inside the hole next to the edge: the hole must stay a
+  # hole (SketchUp does not cut it by the usual add-and-erase).
+  def test_round_keeps_hole_with_a_face_inside
+    build_fixture('doorway')
+    area = wall_face.area
+    e = model.entities.grep(Sketchup::Edge).find do |x|
+      ps = [x.start.position, x.end.position]
+      ps.any? { |p| p.distance(pt(34.251969, 136.614173, 70.0)) < 1e-3 } && ps.any? { |p| p.distance(pt(24.803150, 136.614173, 90.5)) < 1e-3 }
+    end
+    model.selection.add(e)
+    in_wall = lambda { faces.count { |f| f.normal.x.abs > 0.999 && (f.vertices[0].position.x - 34.251969).abs < 1e-3 } }
+    before = in_wall.call
+    assert SimpleCorners.apply(:round, 2.0), UI.messages.inspect
+    w = wall_face
+    assert_equal 4, w.loops.size, 'door hole kept'
+    assert_equal before, in_wall.call, 'no new face in the wall plane: nothing covers the door'
+    assert_operator w.area, :<, area + 1e-6
+  end
+
+  # The top of a ring of walls crossed by a partition: one outline that
+  # runs out and back over the partition's edge (outer ring, edge, inner
+  # ring backwards, edge back). SketchUp makes such faces but add_face
+  # cannot take the outline back; it is built as a ring with a hole.
+  def test_outline_through_a_point_twice_becomes_a_face_with_a_hole
+    outer = [[0, 5], [0, 0], [10, 0], [10, 10], [0, 10], [0, 5]]
+    inner = [[3, 5], [3, 7], [7, 7], [7, 3], [3, 3], [3, 5]]
+    pts = (outer + inner).map { |x, y| pt(x, y, 0) }
+    f = SimpleCorners::Bridge.add_face(model.entities, pts)
+    refute_nil f
+    assert_equal [5, 5], f.loops.map { |l| l.vertices.size }.sort # bridge ends stay on the rings
+    assert(f.loops.reject(&:outer?).first.vertices.all? { |v| (3..7).cover?(v.position.x) && (3..7).cover?(v.position.y) }, "inner ring is the hole")
+    assert_equal 1, faces.size
+  end
+
+  # Everything in the model, by position (faces and edges with their faces).
+  def snapshot
+    ents = model.entities
+    key = lambda { |p| p.to_a.map { |x| x.round(6) } }
+    fs = ents.grep(Sketchup::Face).map { |f| f.vertices.map { |v| key.call(v.position) }.sort }.sort
+    es = ents.grep(Sketchup::Edge).map { |e| [[key.call(e.start.position), key.call(e.end.position)].sort, e.faces.size] }.sort
+    [fs, es, ents.to_a.reject { |e| e.is_a?(Sketchup::Face) || e.is_a?(Sketchup::Edge) }.size]
+  end
+
+  # SketchUp refusing the n-th face (add_face returns nil).
+  def refuse_face(n)
+    calls = 0
+    orig = SimpleCorners::Bridge.method(:add_face)
+    SimpleCorners::Bridge.define_singleton_method(:add_face) do |es, pts|
+      calls += 1
+      calls == n ? nil : orig.call(es, pts)
+    end
+    yield
+  ensure
+    SimpleCorners::Bridge.define_singleton_method(:add_face) { |es, pts| orig.call(es, pts) }
+  end
+
+  # A refused face leaves the model as it was, without relying on the
+  # operation being rolled back (SketchUp 2017 did not always do that; the
+  # mock never does).
+  def test_refused_face_leaves_the_model_untouched_when_rounding
+    build(M.box)
+    model.selection.add(model.entities.grep(Sketchup::Edge).find { |e| e.start.position.z == 10 && e.end.position.z == 10 })
+    before = snapshot
+    [1, 3, 6].each do |n|
+      refuse_face(n) { refute SimpleCorners.apply(:round, 2.0) }
+      assert_equal before, snapshot, "face #{n} refused"
+    end
+    assert SimpleCorners.apply(:round, 2.0), 'and it still works afterwards'
+    assert closed?
+  end
+
+  def test_refused_face_leaves_the_model_untouched_when_reverting
+    build(M.box)
+    model.selection.add(model.entities.grep(Sketchup::Edge).find { |e| e.start.position.z == 10 && e.end.position.z == 10 })
+    assert SimpleCorners.apply(:round, 2.0)
+    tagged = faces.select { |f| f.get_attribute('SimpleCorners', 'op') }
+    before = snapshot
+    [1, 2].each do |n|
+      model.selection.clear
+      model.selection.add(tagged)
+      refuse_face(n) { refute SimpleCorners::Unround.run }
+      assert_equal before, snapshot, "face #{n} refused"
+    end
+    model.selection.clear
+    model.selection.add(tagged)
+    assert SimpleCorners::Unround.run, UI.messages.inspect
+    assert_equal 6, faces.size
+    assert closed?
+  end
+
   def test_unexpected_error_is_reported
     build(M.box)
     model.selection.add(faces.first)

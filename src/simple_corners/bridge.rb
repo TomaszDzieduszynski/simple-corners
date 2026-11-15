@@ -62,7 +62,7 @@ module SimpleCorners
 
       fmt = lambda { |x| Sketchup.format_length(x) }
       # Fits the radius: smaller only at the corners where it does not fit.
-      eng = Core::Engine.fit(pts, fdata, sel, opts.merge(:format => fmt))
+      eng = Core::Engine.fit(pts, fdata, sel, opts.merge(:format => fmt, :merge_dist => MIN_DIST))
       [eng, faces, verts]
     end
 
@@ -116,7 +116,7 @@ module SimpleCorners
 
     def self.apply(ents, eng, faces, verts, opts = {})
       pts = eng.points
-      gp = lambda { |id| Geom::Point3d.new(pts[id][0], pts[id][1], pts[id][2]) }
+      gp = welder(pts, verts)
 
       # Remember what must survive the rebuild.
       fattr = {}
@@ -133,32 +133,33 @@ module SimpleCorners
         trim_info << [e.start.position, e.end.position, edge_attrs(e)] if e
       end
 
-      to_erase = eng.face_loops.keys.map { |fi| faces[fi] } + removed
-      ents.erase_entities(to_erase.select(&:valid?))
-
-      before = {}
-      ents.grep(Sketchup::Face).each { |f| before[f] = true }
-      created = []
+      # Everything new is built first in a temporary group, away from the
+      # model: if SketchUp refuses a face, the group is deleted and the
+      # model has not changed at all. (SketchUp 2017 does not always roll
+      # back an aborted operation in which faces were erased and a new face
+      # was refused; the model was left half rebuilt, beyond undo.) Only
+      # then are the old faces erased and the group exploded in place.
+      tmp = ents.add_group
+      te = tmp.entities
+      # An empty group can be discarded by SketchUp as soon as another
+      # group is added inside it (faces with holes are built that way):
+      # a construction point keeps it until it is exploded.
+      guard = te.add_cpoint(Geom::Point3d.new(0, 0, 0))
       failed = 0
 
       eng.face_loops.each do |fi, loops|
-        f = add_face(ents, loops[0].map(&gp))
-        unless f
-          failed += 1
-          next
+        f = add_face_loops(te, loops.map { |lp| lp.map(&gp) }) do |x|
+          x.reverse! if x.normal.dot(Geom::Vector3d.new(*fattr[fi][:normal])) < 0
+          apply_face_attrs(x, fattr[fi])
         end
-        f.reverse! if f.normal.dot(Geom::Vector3d.new(*fattr[fi][:normal])) < 0
-        apply_face_attrs(f, fattr[fi])
-        created << f
-        loops[1..-1].each do |lp|
-          hole = add_face(ents, lp.map(&gp))
-          hole.erase! if hole && hole.valid? && hole != f && !before[hole]
-        end
+        failed += 1 unless f
       end
 
       eng.new_polys.each do |poly|
         q = poly[:ids].map(&gp)
-        f = add_face(ents, q)
+        # A sliver whose corners SketchUp merges anyway: nothing to make.
+        next if sliver?(q)
+        f = add_face(te, q)
         unless f
           failed += 1
           next
@@ -172,17 +173,110 @@ module SimpleCorners
           f.set_attribute(DICT, 'segments', opts[:segments].to_i) if opts[:segments]
           f.set_attribute(DICT, 'smooth', opts[:smooth] != false)
         end
-        created << f
       end
 
       if failed > 0
+        tmp.erase!
         raise Error, "#{failed} face(s) could not be created. The new geometry is probably " \
                      'too small for SketchUp (tolerance 0.001"). Try a larger offset or fewer ' \
                      'segments, or scale the model up (x10 or x100), apply, and scale it back.'
       end
 
+      # Edges that are open (one face) already stay allowed to be.
+      open_before = {}
+      faces.each { |f| f.edges.each { |e| open_before[edge_key(e)] = true if e.faces.size == 1 } }
+
+      to_erase = eng.face_loops.keys.map { |fi| faces[fi] } + removed
+      ents.erase_entities(to_erase.select(&:valid?))
+      drop_stray_edges(old_edges, te)
+      guard.erase! if guard.valid?
+      created = (tmp.explode || []).grep(Sketchup::Face)
+
       finish_edges(created, eng, trim_info, opts[:smooth] != false)
       old_edges.each { |e| e.erase! if e.valid? && e.faces.empty? }
+      check_closed(created, open_before)
+    end
+
+    # Before the new faces are exploded in place: old edges left without a
+    # face that are not edges of the new faces would be welded into them
+    # and split them, so they go first. Those the new faces use again stay
+    # (with their properties).
+    def self.drop_stray_edges(old_edges, new_ents)
+      keep = {}
+      new_ents.grep(Sketchup::Face).each { |f| f.edges.each { |e| keep[edge_key(e)] = true } }
+      old_edges.each { |e| e.erase! if e.valid? && e.faces.empty? && !keep[edge_key(e)] }
+    end
+
+    def self.edge_key(e)
+      [pkey(e.start.position), pkey(e.end.position)].sort
+    end
+
+    # The new faces must close up with the model: an edge of theirs with a
+    # face on one side only (that was not so before) is a gap, e.g. where
+    # points end up a little more than SketchUp's tolerance apart.
+    # Raises Error; the caller aborts the operation, so nothing changes.
+    # Strict: SketchUp does not weld points that are merely very close when
+    # the new faces are exploded in place (seen 0.0004" apart in a scaled
+    # component), so any open edge is a gap.
+    def self.check_closed(created, open_before)
+      gap = created.select(&:valid?).flat_map(&:edges).uniq.find do |e|
+        e.faces.size == 1 && !open_before[edge_key(e)]
+      end
+      return unless gap
+      raise Error, "the result would not close up near #{Sketchup.format_length(gap.length)} long edge at " \
+                   "#{gap.start.position.to_a.map { |x| Sketchup.format_length(x) }.join(', ')} (points end " \
+                   'up a little more than SketchUp\'s 0.001" tolerance apart). Try another radius, or scale ' \
+                   'the model up (x10 or x100), apply, and scale it back.'
+    end
+
+    # Fewer than three points left once points closer than SketchUp's
+    # tolerance are merged.
+    def self.sliver?(pts)
+      keep = []
+      pts.each { |p| keep << p unless keep.any? { |k| k.distance(p) <= MIN_DIST } }
+      keep.size < 3
+    end
+
+    # Points closer than this are one point (SketchUp's tolerance).
+    WELD_DIST = 0.001
+
+    # Point of an engine point id, welded: a point within WELD_DIST of an
+    # existing vertex or of a point made before is that point. SketchUp
+    # snaps a new face to the vertices around it, but the new faces are
+    # built in a group of their own, and exploding it does not weld points
+    # that are merely close; without this, such points would leave
+    # hairline gaps.
+    def self.welder(pts, verts)
+      cell = WELD_DIST * 2
+      grid = {}
+      key = lambda { |a| [(a[0] / cell).floor, (a[1] / cell).floor, (a[2] / cell).floor] }
+      put = lambda { |p| (grid[key.call(p.to_a)] ||= []) << p }
+      find = lambda do |p|
+        a = p.to_a
+        k = key.call(a)
+        [-1, 0, 1].each do |i|
+          [-1, 0, 1].each do |j|
+            [-1, 0, 1].each do |l|
+              (grid[[k[0] + i, k[1] + j, k[2] + l]] || []).each { |q| return q if q.distance(p) <= WELD_DIST }
+            end
+          end
+        end
+        nil
+      end
+      verts.each { |vx| put.call(vx.position) }
+      done = {}
+      lambda do |id|
+        done[id] ||= begin
+          p = Geom::Point3d.new(pts[id][0], pts[id][1], pts[id][2])
+          q = find.call(p)
+          if q
+            q
+          else
+            put.call(p)
+            p
+          end
+        end
+      end
     end
 
     def self.add_face(ents, pts)
@@ -190,9 +284,150 @@ module SimpleCorners
       pts.each { |p| clean << p if clean.empty? || clean.last.distance(p) > MIN_DIST }
       clean.pop while clean.size > 1 && clean.last.distance(clean.first) <= MIN_DIST
       return nil if clean.size < 3
+      # An outline through one point more than once: as simple loops.
+      return add_face_loops(ents, [clean]) if clean.map { |p| pkey(p) }.uniq.size < clean.size
       ents.add_face(clean)
     rescue ArgumentError
       nil
+    end
+
+    # Splits a loop that passes through a point more than once into simple
+    # loops. Such loops come from faces whose outline runs out and back
+    # over edges, e.g. edges that join the outline of a face to one of its
+    # holes (the top of a ring of walls crossed by a partition). SketchUp
+    # makes such faces itself, but cannot take that outline back in
+    # add_face: it fails, and the failure damages the entities it was
+    # called on (later calls find them deleted, and an aborted operation
+    # is not rolled back). Pieces without area (the out-and-back parts)
+    # are dropped.
+    def self.simple_loops(pts)
+      keys = pts.map { |p| pkey(p) }
+      n = pts.size
+      n.times do |i|
+        ((i + 1)...n).each do |j|
+          next unless keys[i] == keys[j]
+          return simple_loops(pts[i...j]) + simple_loops(pts[j..-1] + pts[0...i])
+        end
+      end
+      return [] if n < 3 || newell(pts).length.to_f < MIN_DIST * MIN_DIST
+      [pts]
+    end
+
+    # A point inside a 2D polygon (the middle of a corner triangle that
+    # lies in it), or nil.
+    def self.point_inside(poly)
+      n = poly.size
+      n.times do |i|
+        a = poly[i - 1]
+        b = poly[i]
+        c = poly[(i + 1) % n]
+        q = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0]
+        return q if inside2d?(q, poly)
+      end
+      nil
+    end
+
+    # Creates a face with holes (loops of points, outer first) and returns
+    # it (nil if it could not be created). The block, if given, gets the
+    # face first, to turn it the right way and set its properties.
+    #
+    # SketchUp cuts a hole when a face is added inside another one and
+    # erased again, but not reliably among other geometry: a hole that
+    # already has a face in it (touching its outline) is not cut, and the
+    # face comes out covering the hole. So a face with holes is built on
+    # its own in a temporary group, which is then exploded in place:
+    # SketchUp merges it with what is there as if it had been drawn.
+    #
+    # Loops that pass through a point more than once are split into simple
+    # ones first (see simple_loops); what is an outline and what a hole is
+    # then decided by where the loops lie. Several outlines make several
+    # faces: the largest is returned, and nil if any could not be made.
+    def self.add_face_loops(ents, loops, &blk)
+      simple = loops.flat_map { |lp| simple_loops(lp) }
+      return nil if simple.empty?
+      return face_with_holes(ents, simple, &blk) if simple == loops
+      ax = newell(simple.max_by { |lp| newell(lp).length.to_f }).to_a.map(&:abs)
+      keep = [0, 1, 2] - [ax.index(ax.max)]
+      flat = simple.map { |lp| lp.map { |p| p.to_a.values_at(*keep) } }
+      inner = flat.map { |pl| point_inside(pl) }
+      return nil if inner.any?(&:nil?)
+      depth = flat.each_index.map { |k| flat.each_index.count { |o| o != k && inside2d?(inner[k], flat[o]) } }
+      area = simple.map { |lp| newell(lp).length.to_f }
+      faces = []
+      flat.each_index.select { |k| depth[k].even? }.each do |k|
+        holes = flat.each_index.select do |h|
+          next false unless depth[h] == depth[k] + 1 && inside2d?(inner[h], flat[k])
+          # the smallest outline around it is its own
+          flat.each_index.none? { |o| o != k && depth[o] == depth[k] && area[o] < area[k] && inside2d?(inner[h], flat[o]) }
+        end
+        f = face_with_holes(ents, [simple[k]] + holes.map { |h| simple[h] }, &blk)
+        return nil unless f
+        faces << f
+      end
+      faces.select(&:valid?).max_by(&:area)
+    end
+
+    # One face with holes (outer first); see add_face_loops.
+    def self.face_with_holes(ents, loops)
+      if loops.size == 1
+        f = add_face(ents, loops[0])
+        yield f if f && block_given?
+        return f
+      end
+      g = ents.add_group
+      ge = g.entities
+      f = add_face(ge, loops[0])
+      unless f
+        g.erase!
+        return nil
+      end
+      loops[1..-1].each { |lp| add_face(ge, lp) }
+      # Either of two faces may be the piece inside the hole: tell them
+      # apart by where they lie.
+      ax = newell(loops[0]).to_a.map(&:abs)
+      keep = [0, 1, 2] - [ax.index(ax.max)]
+      holes = loops[1..-1].map { |lp| lp.map { |p| p.to_a.values_at(*keep) } }
+      ge.grep(Sketchup::Face).each do |x|
+        q = inner_point(x, keep)
+        x.erase! if q && holes.any? { |h| inside2d?(q, h) }
+      end
+      left = ge.grep(Sketchup::Face)
+      if left.empty?
+        g.erase!
+        return nil
+      end
+      left.each { |x| yield x } if block_given?
+      (g.explode || []).grep(Sketchup::Face).max_by(&:area)
+    end
+
+    # A point inside face f, in 2D (the coordinates keep): the middle of
+    # a corner triangle of its outline that lies in the face.
+    def self.inner_point(f, keep)
+      outer = f.outer_loop.vertices.map { |v| v.position.to_a.values_at(*keep) }
+      inner = f.loops.reject(&:outer?).map { |lp| lp.vertices.map { |v| v.position.to_a.values_at(*keep) } }
+      n = outer.size
+      n.times do |i|
+        a = outer[i - 1]
+        b = outer[i]
+        c = outer[(i + 1) % n]
+        q = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0]
+        return q if inside2d?(q, outer) && inner.none? { |h| inside2d?(q, h) }
+      end
+      nil
+    end
+
+    # Point in polygon (2D, even-odd rule).
+    def self.inside2d?(q, poly)
+      x, y = q
+      res = false
+      n = poly.size
+      n.times do |i|
+        a = poly[i]
+        b = poly[(i + 1) % n]
+        next unless (a[1] > y) != (b[1] > y)
+        res = !res if x < a[0] + (y - a[1]) * (b[0] - a[0]) / (b[1] - a[1])
+      end
+      res
     end
 
     def self.newell(pts)

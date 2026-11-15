@@ -267,6 +267,66 @@ module MeshHelpers
     probs
   end
 
+  # Round mode: how true each fillet strip is in cross-section. Each
+  # selected edge's strip is cut by the plane perpendicular to the edge at
+  # its middle; every cut point must lie on the fillet, at least
+  # R * cos(half a segment's angle) from its axis (R the arc's own radius).
+  # A twisted strip (lines joining mismatched profile points) dips inside.
+  # Returns [worst, edge]: the smallest distance found over that limit
+  # (1.0 = as faceting allows, below = dips inward). Edges ending at an
+  # averaged-mitre fallback corner (known slight taper) are skipped unless
+  # all is set; per (a Hash) collects every edge's value.
+  def self.section_depth(mesh, eng, sel, r, segs, all = false, per = nil)
+    worst = [1.0, nil]
+    fb = eng.mitre_fallbacks
+    sel.each do |a, b|
+      k = [a, b].sort
+      next if !all && (fb.include?(a) || fb.include?(b))
+      rk = eng.reduced[k] || r
+      pa = mesh.points[a]
+      u = V.norm(V.sub(mesh.points[b], pa))
+      mid = V.lerp(pa, mesh.points[b], 0.5)
+      off = lambda { |p| w = V.sub(p, pa); V.len(V.sub(w, V.mul(u, V.dot(w, u)))) }
+      fs = mesh.faces.each_index.select do |fi|
+        mesh.faces[fi][:loops].any? { |lp| lp.each_index.any? { |i| [lp[i], lp[(i + 1) % lp.size]].sort == k } }
+      end
+      next unless fs.size == 2
+      n1 = V.norm(mesh.faces[fs[0]][:normal])
+      n2 = V.norm(mesh.faces[fs[1]][:normal])
+      d = V.dot(n1, n2)
+      next if 1 + d < 1e-6 || 1 - d < 1e-6
+      cuts = []
+      eng.new_polys.each do |poly|
+        next unless poly[:kind] == :strip
+        pts = poly[:ids].map { |i| eng.points[i] }
+        next unless pts.all? { |p| off.call(p) < 1.5 * rk }
+        pts.each_index do |i|
+          p = pts[i]
+          q = pts[(i + 1) % pts.size]
+          sp = V.dot(V.sub(p, mid), u)
+          sq = V.dot(V.sub(q, mid), u)
+          next if sp * sq > 0 || sp == sq
+          cuts << V.lerp(p, q, sp / (sp - sq))
+        end
+      end
+      next if cuts.empty?
+      # The radius setting is the setback along each face (tangent lines rk
+      # from the edge): the arc's own radius is rk * tan(half the angle
+      # between the faces), its axis on the bisector, on the fillet's side.
+      big = Math.sqrt((1 + d) / (1 - d)) * rk
+      dist = rk / Math.sqrt((1 - d) / 2)
+      bis = V.norm(V.add(n1, n2))
+      best = [-1.0, 1.0].map do |s|
+        c = V.add(mid, V.mul(bis, s * dist))
+        cuts.map { |p| w = V.sub(p, c); V.len(V.sub(w, V.mul(u, V.dot(w, u)))) / big }
+      end.min_by { |ds| ds.map { |x| (x - 1).abs }.max }
+      lo = best.min / Math.cos(Math.acos(d) / segs / 2)
+      per[k] = lo if per
+      worst = [lo, k] if lo < worst[0]
+    end
+    worst
+  end
+
   def self.write_obj(path, mesh, eng)
     pts = eng.points
     File.open(path, 'w') do |f|

@@ -14,19 +14,22 @@ is the only file you need (it is also listed under *Assets* below). The
 Updating from an earlier version: uninstall it first, or restart SketchUp
 after installing.
 
-## What's new in 1.2.1
+## What's new in 1.2.2
 
-*Revert to sharp edge* is much more capable (still experimental: check the
-result, Ctrl+Z undoes it). The package is signed.
+A bug-fix release: rounding is safer and more exact at tricky corners. The
+package is signed.
 
-- **Any rounded or bevelled surface** can be made sharp again: connected
-  fillets, rounded corners, a whole rounded solid, faceted faces, several
-  surfaces at once, also fillets made by other tools.
-- **Part of a rounded network:** select one fillet, or the top ring of a
-  rounded box. Those edges become sharp; the rest stays rounded with its
-  own radius, style, segments and smoothing (also for *Round Edges,
-  Mitred*).
-- Several copies of a group selected together are all processed, and
-  groups nested inside a selected group are processed too.
+- **Safe on failure:** if a rounding or revert cannot be finished, the
+  model stays exactly as it was (it could be left damaged before, with
+  Ctrl+Z not working).
+- **Exact ends:** a fillet ending against a face at an angle lies flat on
+  it; the radius stays the same along the whole edge (one rare exception,
+  see *Good to know* in the README); two fillets meeting at a sharp edge
+  meet in a clean mitre, without spikes at shallow angles.
+- **Doorways:** rounding the edges of a face with a hole no longer closes
+  the hole.
+- **Fixes:** faces whose outline passes twice through one point can be
+  rebuilt; mitred corners with three selected edges no longer fold; revert
+  recognises fillets ending on divided wall faces.
 
 Full history: [CHANGELOG.md](https://github.com/TomaszDzieduszynski/simple-corners/blob/main/CHANGELOG.md).

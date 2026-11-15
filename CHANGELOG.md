@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.2.2
+
+- A rounding or revert that cannot be finished no longer damages the
+  model: the new surfaces are built first, and if any of them fails the
+  model stays exactly as it was. Ctrl+Z always works.
+- Faces whose outline passes twice through the same point (e.g. a wall top
+  crossed by a partition) can be rebuilt; such faces used to make the whole
+  operation fail.
+- An edge ending against a face at an angle: the fillet's end lies flat on
+  that face, also where one face of the edge carries on past the corner
+  (e.g. a block standing against a wall).
+- Rounding the edges of a doorway (a face with a hole) no longer closes the
+  hole.
+- The radius stays the same along the whole edge (it could taper, e.g. on a
+  sloping sill in a door opening). One rare exception remains, described in
+  the README under *Good to know*.
+- Two rounded edges meeting at a corner whose third edge stays sharp: the
+  fillets meet in a clean mitre, one running on until its end lies flat on
+  the other's surface. Where edges meet at a very shallow angle, the
+  fillets end square instead of running out into long spikes.
+- *Round Edges, Mitred*: a corner where all three edges are selected no
+  longer folds two of its faces over each other.
+- *Revert to sharp edge* recognises a rounded edge ending on a wall face
+  that is divided by other edges.
+
 ## 1.2.1
 
 - *Revert to sharp edge* works on part of a rounded network: select one

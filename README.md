@@ -6,7 +6,7 @@ faces with holes.
 
 ## [⬇ Download Simple Corners (simple_corners.rbz)](https://github.com/TomaszDzieduszynski/simple-corners/releases/latest/download/simple_corners.rbz)
 
-Version 1.2.1 · SketchUp 2017 or newer · Windows and Mac · free and open
+Version 1.2.2 · SketchUp 2017 or newer · Windows and Mac · free and open
 source · signed by SketchUp's extension signing service
 
 ![The three tools on the same L-shaped block](docs/images/tools.png)
@@ -64,6 +64,13 @@ do.
 - **Radius too large for some edges?** The tools shrink it only on the edges
   where it does not fit, so nothing breaks. A notice tells you how many
   edges were reduced.
+- **Radius is exact,** with one rare exception: two rounded edges meet a
+  third edge that stays sharp, at different heights on it (sloping or
+  skewed faces), and one face's corner there is narrower than 90°. Neither
+  fillet can then end cleanly on the other, so they meet halfway, and near
+  that corner the fillets can be up to about 9% wider or narrower than the
+  radius you typed, returning to it along the edge. Square, boxy shapes
+  never hit this.
 - **Groups and components:** select them and the whole object is processed.
   All copies of a component change together, because they share one
   definition.

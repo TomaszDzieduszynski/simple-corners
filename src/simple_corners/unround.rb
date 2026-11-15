@@ -629,15 +629,18 @@ module SimpleCorners
           cnt[key.call(Geom::Point3d.new(*a), Geom::Point3d.new(*b))] += 1
         end
       end
-      open = {}
+      # An edge that exists already keeps as many faces as it has now (one
+      # on an open outline, three or more where the model is not a clean
+      # solid): only what the revert itself builds is judged.
+      was = {}
       removed.flat_map(&:vertices).uniq.flat_map(&:edges).uniq.each do |e|
         k = key.call(e.start.position, e.end.position)
-        open[k] = true if e.faces.size == 1
+        was[k] = e.faces.size
         next unless cnt.key?(k)
         cnt[k] += e.faces.count { |f| !gone[f] }
       end
       cnt.each do |k, c|
-        next if c == 2 || (c == 1 && open[k])
+        next if c == (was[k] && was[k] != 2 ? was[k] : 2)
         raise Error, 'not recognised (the rebuilt faces would not close up).'
       end
     end
@@ -678,38 +681,56 @@ module SimpleCorners
       centre = V.avg(faces.flat_map(&:vertices).uniq.map { |x| pos(x) })
 
       border = border_keys(faces + repl.keys)
-      created = []
       group = {}
       (faces + repl.keys).each { |f| group[f] = true }
       old_edges = (faces + repl.keys).flat_map(&:edges).uniq
       # Edges only used inside the rebuilt area are removed too (avoids
       # leftover split points on the extended edges).
       inner = old_edges.select { |e| e.faces.all? { |f| group[f] } }
-      ents.erase_entities((faces + repl.keys + inner).select(&:valid?))
 
       gp = lambda { |a| Geom::Point3d.new(a[0], a[1], a[2]) }
-      repl.each_key do |f|
-        d = data[f]
-        nf = Bridge.add_face(ents, d[:loops][0].map(&gp))
-        raise Error, 'a face could not be rebuilt.' unless nf
-        nf.reverse! if nf.normal.dot(Geom::Vector3d.new(*d[:normal])) < 0
-        copy_attrs(nf, d)
-        created << nf
-        d[:loops][1..-1].each do |lp|
-          hole = Bridge.add_face(ents, lp.map(&gp))
-          hole.erase! if hole && hole.valid? && hole != nf
+      created = build_then_swap(ents, faces + repl.keys + inner, old_edges) do |te|
+        repl.each_key do |f|
+          d = data[f]
+          nf = Bridge.add_face_loops(te, d[:loops].map { |lp| lp.map(&gp) }) do |x|
+            x.reverse! if x.normal.dot(Geom::Vector3d.new(*d[:normal])) < 0
+            copy_attrs(x, d)
+          end
+          raise Error, 'a face could not be rebuilt.' unless nf
         end
-      end
-      caps.each do |pts|
-        cf = Bridge.add_face(ents, pts.map(&gp))
-        raise Error, 'an end cap could not be created.' unless cf
-        # Facing away from the removed surface (outward at the strip end).
-        cf.reverse! if cf.normal.dot(Geom::Vector3d.new(*V.sub(pts[0], centre))) < 0
-        copy_attrs(cf, src)
-        created << cf
+        caps.each do |pts|
+          cf = Bridge.add_face(te, pts.map(&gp))
+          raise Error, 'an end cap could not be created.' unless cf
+          # Facing away from the removed surface (outward at the strip end).
+          cf.reverse! if cf.normal.dot(Geom::Vector3d.new(*V.sub(pts[0], centre))) < 0
+          copy_attrs(cf, src)
+        end
       end
       old_edges.each { |e| e.erase! if e.valid? && e.faces.empty? }
       check_closed(created, border)
+    end
+
+    # Builds the new faces (the block gets a temporary group's entities)
+    # before anything in the model changes; only when all of them could be
+    # made are the old faces erased and the group exploded in place. If
+    # SketchUp refuses a face, the model is untouched (SketchUp 2017 does
+    # not always roll back an aborted operation in which faces were erased
+    # and a new face refused). Returns the new faces.
+    def self.build_then_swap(ents, erase, old_edges = [])
+      tmp = ents.add_group
+      te = tmp.entities
+      # keeps the group while a face with holes is built in a group of its own
+      guard = te.add_cpoint(Geom::Point3d.new(0, 0, 0))
+      begin
+        yield te
+      rescue StandardError
+        tmp.erase! if tmp.valid?
+        raise
+      end
+      ents.erase_entities(erase.select(&:valid?))
+      Bridge.drop_stray_edges(old_edges, te)
+      guard.erase! if guard.valid?
+      (tmp.explode || []).grep(Sketchup::Face)
     end
 
     # Reverts a whole network (Resharpen): the faces around the surface get
@@ -770,34 +791,37 @@ module SimpleCorners
         end
       end
       old_edges = (faces + olds).flat_map(&:edges).uniq
-      ents.erase_entities((faces + olds).select(&:valid?))
-      old_edges.each { |e| e.erase! if e.valid? && e.faces.empty? }
 
       gp = lambda { |a| Geom::Point3d.new(a[0], a[1], a[2]) }
-      newf = {}
-      rebuild.each do |d|
-        nf = Bridge.add_face(ents, d[:loops][0].map(&gp))
-        raise Error, 'a face could not be rebuilt.' unless nf
-        nf.reverse! if nf.normal.dot(Geom::Vector3d.new(*d[:normal])) < 0
-        copy_attrs(nf, d)
-        d[:loops][1..-1].each do |lp|
-          hole = Bridge.add_face(ents, lp.map(&gp))
-          hole.erase! if hole && hole.valid? && hole != nf
+      # properties for the edges between two rebuilt faces, by position
+      props = {}
+      created = build_then_swap(ents, faces + olds, old_edges) do |te|
+        newf = {}
+        rebuild.each do |d|
+          nf = Bridge.add_face_loops(te, d[:loops].map { |lp| lp.map(&gp) }) do |x|
+            x.reverse! if x.normal.dot(Geom::Vector3d.new(*d[:normal])) < 0
+            copy_attrs(x, d)
+          end
+          raise Error, 'a face could not be rebuilt.' unless nf
+          newf[d[:old]] = nf
         end
-        newf[d[:old]] = nf
-      end
-      pairs.each do |(a, b), at|
-        na = newf[a]
-        nb = newf[b]
-        next unless na && nb && na.valid? && nb.valid?
-        (na.edges & nb.edges).each do |e|
-          e.soft = at[:soft]
-          e.smooth = at[:smooth]
-          e.hidden = at[:hidden]
+        pairs.each do |(a, b), at|
+          na = newf[a]
+          nb = newf[b]
+          next unless na && nb && na.valid? && nb.valid?
+          (na.edges & nb.edges).each { |e| props[ekey(e.start.position, e.end.position)] = at }
         end
       end
-      check_closed(newf.values, border)
-      newf.values
+      old_edges.each { |e| e.erase! if e.valid? && e.faces.empty? }
+      created.select(&:valid?).flat_map(&:edges).uniq.each do |e|
+        at = props[ekey(e.start.position, e.end.position)]
+        next unless at
+        e.soft = at[:soft]
+        e.smooth = at[:smooth]
+        e.hidden = at[:hidden]
+      end
+      check_closed(created, border)
+      created
     end
 
     def self.ekey(a, b)

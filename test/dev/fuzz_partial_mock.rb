@@ -98,6 +98,10 @@ ROUNDS.times do |it|
   SC::Settings.smooth = rng.rand < 0.8
   r = 0.3 + 1.2 * rng.rand
   desc = "round #{it} #{mode} r=#{r.round(3)} seg=#{SC::Settings.segments} smooth=#{SC::Settings.smooth?} edges=#{back.size}/#{rounded.size}/#{all.size}"
+  if ENV['DUMP_ROUND'] && ENV['DUMP_ROUND'].to_i == it
+    File.write(ENV['DUMP_ROUND_TO'], { :points => mesh.points, :faces => mesh.faces, :rounded => rounded, :back => back, :mode => mode,
+                                       :r => r, :segs => SC::Settings.segments, :smooth => SC::Settings.smooth?, :desc => desc }.inspect)
+  end
   unless make(mesh, rounded - back, mode, r)
     stats[:skipped] += 1
     next

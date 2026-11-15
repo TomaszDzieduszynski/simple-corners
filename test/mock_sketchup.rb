@@ -316,6 +316,10 @@ module Sketchup
       [@start, @end]
     end
 
+    def length
+      @start.position.distance(@end.position)
+    end
+
     def other(v)
       v == @start ? @end : @start
     end
@@ -331,6 +335,19 @@ module Sketchup
 
     def erase!
       @parent.entities.erase_entities([self])
+    end
+  end
+
+  class ConstructionPoint < Drawingelement
+    attr_reader :position
+
+    def initialize(p, parent)
+      @position = p
+      @parent = parent
+    end
+
+    def erase!
+      mark_deleted
     end
   end
 
@@ -351,10 +368,67 @@ module Sketchup
     attr_accessor :back_material
     attr_reader :parent, :normal
 
+    # Face this one was created inside of (coplanar): erasing this face
+    # leaves a hole in it, as in SketchUp.
+    attr_accessor :inside
+    attr_reader :holes
+
     def initialize(vs, parent)
       @vs = vs
       @parent = parent
       @normal = newell
+      @holes = []
+    end
+
+    def add_hole(vs)
+      return if @holes.any? { |h| h.size == vs.size && (h - vs).empty? }
+      @holes << vs
+      loop_edges(vs).each { |e| e.faces << self if e && !e.faces.include?(self) }
+    end
+
+    def loop_edges(vs)
+      (0...vs.size).map { |i| vs[i].common_edge(vs[(i + 1) % vs.size]) }
+    end
+
+    # 2D coordinates in the face plane (dominant axis dropped).
+    def flat(p)
+      n = @normal.to_a.map(&:abs)
+      keep = [0, 1, 2] - [n.index(n.max)]
+      p.to_a.values_at(*keep)
+    end
+
+    def contains?(p)
+      q = flat(p)
+      inside = lambda do |vs|
+        res = false
+        vs.each_index do |i|
+          a = flat(vs[i].position)
+          b = flat(vs[(i + 1) % vs.size].position)
+          next unless (a[1] > q[1]) != (b[1] > q[1])
+          res = !res if q[0] < a[0] + (q[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1])
+        end
+        res
+      end
+      inside.call(@vs) && @holes.none? { |h| inside.call(h) }
+    end
+
+    def on_plane?(p)
+      o = @vs[0].position
+      d = [p.x - o.x, p.y - o.y, p.z - o.z]
+      n = @normal.to_a
+      (d[0] * n[0] + d[1] * n[1] + d[2] * n[2]).abs < 1e-6
+    end
+
+    # A point inside the face (centroid of an ear of the outer loop).
+    def interior_point
+      k = @vs.size
+      k.times do |i|
+        tri = [@vs[i - 1], @vs[i], @vs[(i + 1) % k]].map { |v| v.position.to_a }
+        c = (0..2).map { |j| (tri[0][j] + tri[1][j] + tri[2][j]) / 3.0 }
+        p = Geom::Point3d.new(*c)
+        return p if contains?(p)
+      end
+      @vs[0].position
     end
 
     def newell
@@ -372,7 +446,7 @@ module Sketchup
     end
 
     def vertices
-      @vs
+      @vs + @holes.flatten
     end
 
     def area
@@ -394,18 +468,23 @@ module Sketchup
 
     def mesh(_flags = 0)
       pts = @vs.map(&:position)
+      ip = interior_point
+      tri = [ip, ip, ip]
+      holes = !@holes.empty?
       o = Object.new
       o.define_singleton_method(:count_polygons) { 1 }
-      o.define_singleton_method(:polygon_points_at) { |_i| pts }
+      # A face with holes: one small triangle inside it (enough for tests
+      # that only need a point of the face).
+      o.define_singleton_method(:polygon_points_at) { |_i| holes ? tri : pts }
       o
     end
 
     def loops
-      [outer_loop]
+      [outer_loop] + @holes.map { |h| Loop.new(h, false) }
     end
 
     def edges
-      (0...@vs.size).map { |i| @vs[i].common_edge(@vs[(i + 1) % @vs.size]) }
+      loop_edges(@vs) + @holes.flat_map { |h| loop_edges(h) }
     end
 
     def reverse!
@@ -466,9 +545,28 @@ module Sketchup
         @items << Edge.new(a, b, @parent)
       end
       f = Face.new(vs, @parent)
+      # Created inside a coplanar face: that face gets a hole there at once
+      # (as in SketchUp), which stays when the new face is erased.
+      ip = f.interior_point
+      f.inside = @items.find do |h|
+        h.is_a?(Face) && h.valid? && vs.all? { |v| h.on_plane?(v.position) } && h.contains?(ip)
+      end
+      # ...unless another face already lies inside the new one: SketchUp
+      # then cuts no hole (seen in SketchUp 2017).
+      if f.inside && @items.any? { |x| x.is_a?(Face) && x.valid? && x != f.inside && vs.all? { |v| x.on_plane?(v.position) } && f.contains?(x.interior_point) }
+        f.inside = nil
+      end
       f.edges.each { |e| e.faces << f }
+      f.inside.add_hole(vs) if f.inside
       @items << f
       f
+    end
+
+    # Construction point (only kept and erased by the code under test).
+    def add_cpoint(p)
+      c = ConstructionPoint.new(p, @parent)
+      @items << c
+      c
     end
 
     def erase_entities(list)
@@ -478,6 +576,8 @@ module Sketchup
         if e.is_a?(Face)
           e.edges.each { |x| x.faces.delete(e) if x }
           e.mark_deleted
+          h = e.inside
+          h.add_hole(e.vertices) if h && h.valid? && e.holes.empty?
         elsif e.is_a?(Edge)
           e.faces.dup.each { |f| erase_entities([f]) }
           e.vertices.each { |v| v.edges.delete(e) }
@@ -597,6 +697,37 @@ module Sketchup
       Geom::BoundingBox.new
     end
 
+    # Entities collection the group was added to.
+    attr_accessor :owner
+
+    def erase!
+      mark_deleted
+    end
+
+    # Moves the group's faces (with their holes) into its owner; returns
+    # the new entities.
+    def explode
+      out = []
+      entities.grep(Face).each do |f|
+        nf = @owner.add_face(f.outer_loop.vertices.map(&:position))
+        nf.inside = nil
+        nf.reverse! if nf.normal.dot(f.normal) < 0
+        f.holes.each do |h|
+          hf = @owner.add_face(h.map(&:position))
+          hf.inside = nf
+          hf.erase!
+        end
+        nf.material = f.material
+        nf.back_material = f.back_material
+        nf.layer = f.layer
+        nf.instance_variable_set(:@attrs, f.instance_variable_get(:@attrs))
+        out << nf
+        out.concat(nf.edges)
+      end
+      mark_deleted
+      out
+    end
+
     # Like SketchUp: a group sharing its definition with copies gets its
     # own copy of the geometry.
     def make_unique
@@ -617,6 +748,7 @@ module Sketchup
   class Entities
     def add_group
       g = Group.new
+      g.owner = self
       @items << g
       g
     end

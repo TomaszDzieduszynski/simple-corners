@@ -4,6 +4,7 @@ require_relative 'mesh_helpers'
 
 class TestCore < Minitest::Test
   M = MeshHelpers
+  V = M::V
   MODES = [:round, :sharp, :bevel].freeze
 
   def run_ok(mesh, sel, opts)
@@ -326,6 +327,170 @@ class TestCore < Minitest::Test
         run_ok(mesh, sel, opts)
       rescue SimpleCorners::Core::OffsetError => e
         assert_match(/does not fit/i, e.message)
+      end
+    end
+  end
+
+  # An edge that runs into a wall at an angle (a block with a sloping top
+  # against a wall): its end is the exact cut of the fillet by the wall, so
+  # it lies flat on the wall, and the strip is made of flat quads.
+  def test_slanted_edge_ends_flat_on_the_wall
+    d = eval(File.read(File.expand_path('fixtures/slanted_edge.rb', __dir__)))
+    mesh = M::Mesh.new(d[:points], d[:faces])
+    sel = M.edges_where(mesh) { |a, b| (a[0] - 227.36).abs < 0.01 && (b[0] - 227.36).abs < 0.01 && a[1] != b[1] && a[2] != b[2] }
+    assert_equal 1, sel.size
+    wall = mesh.faces.index { |f| f[:normal][1] < -0.99 && f[:loops][0].size == 6 }
+    { :round => 4, :sharp => 4, :bevel => 1 }.each do |mode, strips|
+      eng = run_ok(mesh, sel, :mode => mode, :offset => 7.874, :segments => 4)
+      assert_equal [:strip] * strips, eng.new_polys.map { |p| p[:kind] }, "#{mode}: flat strips only, no end patch"
+      lp = eng.face_loops[wall][0]
+      assert_equal 6 + strips, lp.size, "#{mode}: the wall follows the end of the fillet"
+      # the wall's sharp corner is gone
+      refute(lp.any? { |v| V.dist(eng.points[v], [227.362205, 0.0, 88.582677]) < 1e-3 }, mode.to_s)
+      # both ends are the same curve (the fillet has one cross-section)
+      next if mode == :bevel
+      back = eng.points.select { |p| p[1].abs < 1e-9 && p[0] > 227.37 && p[0] < 235.2 }.map { |p| p[0] }.sort
+      front = eng.points.select { |p| (p[1] + 37.795276).abs < 1e-6 && p[0] > 227.37 && p[0] < 235.2 }.map { |p| p[0] }.sort
+      assert_equal 3, back.size
+      back.zip(front).each { |a, b| assert_in_delta a, b, 1e-6 }
+    end
+  end
+
+  # The same block, the edge on its other side: there the block's side is
+  # one face with the side of the wall (a reflex corner where the edge
+  # ends). The fillet runs on to the wall's plane and ends flat on it; it
+  # must not be squared off inside the wall.
+  def test_slanted_edge_on_a_shared_side_face_ends_on_the_wall
+    d = eval(File.read(File.expand_path('fixtures/slanted_edge.rb', __dir__)))
+    mesh = M::Mesh.new(d[:points], d[:faces])
+    sel = M.edges_where(mesh) { |a, b| (a[0] - 278.74).abs < 0.01 && (b[0] - 278.74).abs < 0.01 && a[1] != b[1] && a[2] != b[2] }
+    assert_equal 1, sel.size
+    wall = mesh.faces.index { |f| f[:normal][1] < -0.99 && f[:loops][0].size == 6 }
+    side = mesh.faces.index { |f| f[:normal][0] > 0.99 }
+    { :round => 4, :sharp => 4, :bevel => 1 }.each do |mode, strips|
+      eng = run_ok(mesh, sel, :mode => mode, :offset => 7.874, :segments => 4)
+      assert_equal [:strip] * strips, eng.new_polys.map { |p| p[:kind] }, "#{mode}: flat strips only, no end patch"
+      news = eng.points[mesh.points.size..-1]
+      assert(news.all? { |p| p[1] < 1e-9 }, "#{mode}: nothing reaches into the wall")
+      # the wall's front face comes down along its corner to the fillet's end
+      low = [278.740157, 0.0, 88.59748 - 7.874 / 0.796508]
+      [wall, side].each do |fi|
+        assert(eng.face_loops[fi][0].any? { |v| V.dist(eng.points[v], low) < 1e-3 }, "#{mode}: face #{fi}")
+      end
+      assert_equal 6 + strips + 1, eng.face_loops[wall][0].size, mode.to_s
+    end
+  end
+
+  # The same kind of block with both its sloping edge (convex, on the side
+  # shared with the wall) and its edge along the wall (concave) selected:
+  # the sloping fillet still runs on to the wall's plane, and nothing is
+  # built behind the wall or beyond the side.
+  def test_sloping_and_wall_edges_together_end_on_the_wall
+    d = eval(File.read(File.expand_path('fixtures/sloped_block_shared_side.rb', __dir__)))
+    mesh = M::Mesh.new(d[:points], d[:faces])
+    top = [102.755906, 0.0, 88.59748]
+    sel = M.edges_where(mesh) do |a, b|
+      [a, b].any? { |p| V.dist(p, top) < 1e-3 } && [a, b].none? { |p| p[2] > 100 }
+    end
+    assert_equal 2, sel.size
+    side = mesh.faces.index { |f| f[:normal][0] > 0.99 }
+    [:round, :sharp, :bevel].each do |mode|
+      eng = run_ok(mesh, sel, :mode => mode, :offset => 7.874, :segments => 4)
+      news = eng.points[mesh.points.size..-1]
+      assert(news.all? { |p| p[1] < 1e-6 }, "#{mode}: nothing behind the wall")
+      assert(news.all? { |p| p[0] < 102.755906 + 1e-6 }, "#{mode}: nothing beyond the side")
+      low = [102.755906, 0.0, 88.59748 - 7.874 / 0.796508]
+      assert(eng.face_loops[side][0].any? { |v| V.dist(eng.points[v], low) < 1e-3 }, "#{mode}: side runs down the wall corner")
+    end
+  end
+
+  # A box with a tilted top, its top edges selected: at each top corner the
+  # vertical edge meets the two top edges at different angles, so their
+  # offset lines cross it at different heights. Each fillet keeps its
+  # radius along its whole length (nothing in a side face comes closer to
+  # its top edge than the radius), and the corners are mitres, with one
+  # fillet running on past the mitre where needed: no filler patches.
+  def test_radius_constant_where_offset_lines_cross_an_edge_at_different_points
+    [[10, 15], [10, 13], [13, 10]].each do |z1, z2|
+      pts = [[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0], [0, 0, z1], [10, 0, z2], [10, 10, z2], [0, 10, z1]].map { |p| p.map(&:to_f) }
+      faces = [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]].map { |lp| M.face([lp], pts) }
+      mesh = M::Mesh.new(pts, faces)
+      sel = [[4, 5], [5, 6], [6, 7], [7, 4]]
+      r = 1.0
+      dist_line = lambda { |p, a, b| u = V.norm(V.sub(b, a)); w = V.sub(p, a); V.len(V.sub(w, V.mul(u, V.dot(w, u)))) }
+      [:round, :sharp, :bevel].each do |mode|
+        eng = run_ok(mesh, sel, :mode => mode, :offset => r, :segments => 4)
+        assert_empty eng.reduced, "#{mode} #{z1}/#{z2}"
+        assert_equal [:strip], eng.new_polys.map { |p| p[:kind] }.uniq, "#{mode} #{z1}/#{z2}: no filler patches"
+        (2..5).each do |fi|
+          top = sel.find { |a, b| faces[fi][:loops][0].include?(a) && faces[fi][:loops][0].include?(b) }
+          eng.face_loops[fi][0].select { |v| v >= pts.size }.each do |v|
+            dd = dist_line.call(eng.points[v], pts[top[0]], pts[top[1]])
+            assert_operator dd, :>=, r - 1e-9, "#{mode} #{z1}/#{z2}: side face #{fi} tapers"
+          end
+        end
+      end
+    end
+  end
+
+  # A steep sill (78 degrees) in a door opening, all four edges selected:
+  # its side edges meet the jambs' vertical corners at about 12 degrees, so
+  # a fillet's offset line would meet those corners about 4.9 radii away.
+  # No fillet may run on that far (a spike along the corner): every new
+  # outline point stays within 1.5 radii of a selected edge.
+  def test_steep_sill_makes_no_spikes
+    d = eval(File.read(File.expand_path('fixtures/steep_sill.rb', __dir__)))
+    mesh = M::Mesh.new(d[:points], d[:faces].map { |f| { :loops => f[:loops], :normal => f[:normal] } })
+    lp = d[:faces].find { |f| f[:sel] }[:loops][0]
+    sel = lp.each_index.map { |i| [lp[i], lp[(i + 1) % lp.size]] }
+    r = 0.14173228
+    seg = lambda do |p, a, b|
+      ab = V.sub(b, a)
+      t = [[V.dot(V.sub(p, a), ab) / V.dot(ab, ab), 0.0].max, 1.0].min
+      V.dist(p, V.add(a, V.mul(ab, t)))
+    end
+    [:round, :sharp, :bevel].each do |mode|
+      eng = M.run(mesh, sel, :mode => mode, :offset => r, :segments => 4)
+      assert_empty M.nonplanar(mesh, eng), mode.to_s
+      eng.face_loops.each_value do |loops|
+        loops.flatten.uniq.select { |v| v >= mesh.points.size }.each do |v|
+          far = sel.map { |a, b| seg.call(eng.points[v], mesh.points[a], mesh.points[b]) }.min
+          assert_operator far, :<=, 1.5 * r, "#{mode}: spike at #{eng.points[v].map { |x| x.round(3) }}"
+        end
+      end
+    end
+  end
+
+  # Mitred mode, corners where all three edges are selected: the corner's
+  # polygons must not fold over each other (two neighbours about 180
+  # degrees apart). Found by the corner fuzzer on a prism with a tilted top.
+  def test_mitred_corner_does_not_fold
+    d = eval(File.read(File.expand_path('fixtures/mitred_fold.rb', __dir__)))
+    mesh = M::Mesh.new(d[:points], d[:faces])
+    eng = run_ok(mesh, d[:sel], :mode => :sharp, :offset => d[:r], :segments => d[:segs])
+    polys = M.result_polys(mesh, eng).flat_map { |loops| [loops[0]] }
+    nrm = polys.map { |lp| V.norm(V.newell(lp.map { |k| eng.points[k] })) }
+    owners = Hash.new { |h, k| h[k] = [] }
+    polys.each_with_index { |lp, pi| lp.each_index { |i| owners[[lp[i], lp[(i + 1) % lp.size]].sort] << pi } }
+    worst = owners.values.select { |l| l.size == 2 }.map do |a, b|
+      Math.acos([[V.dot(nrm[a], nrm[b]), 1.0].min, -1.0].max) * 180 / Math::PI
+    end.max
+    assert_operator worst, :<, 170.0, 'polygons folded over each other'
+  end
+
+  # A fillet is one cross-section swept along its edge. Where one end runs
+  # on past a mitre (its profile has more points), the strip used to join
+  # mismatched points and twist: cut across, it showed two humps instead of
+  # one arc. Every strip's mid section must stay on the fillet.
+  def test_run_on_strips_keep_their_section
+    d = eval(File.read(File.expand_path('fixtures/star_twist.rb', __dir__)))
+    mesh = M::Mesh.new(d[:points], d[:faces])
+    [:round, :sharp].each do |mode|
+      [2, 3, 6, 12].each do |segs|
+        eng = run_ok(mesh, d[:sel], :mode => mode, :offset => d[:r], :segments => segs)
+        refute_empty eng.run_on_ids, 'the case must have run-on ends'
+        worst, edge = M.section_depth(mesh, eng, d[:sel], d[:r], segs)
+        assert_operator worst, :>, 0.98, "#{mode} #{segs} segments: strip of #{edge.inspect} twisted"
       end
     end
   end

@@ -112,6 +112,17 @@ module SimpleCorners
       # neighbour edge (below that, about 10 degrees from straight, the face
       # is treated as straight/reflex at that corner).
       EPS_DIR = 0.17
+      # Two fillets at a corner whose third edge stays sharp: one runs on
+      # past the other (see mitre_and_clip) only if it would stick out along
+      # the sharp edge by at most this fraction of its radius beyond the
+      # other one; otherwise it would make a spike (e.g. a steep sill against
+      # a jamb), so it ends square at the corner, which is blended.
+      MAX_RUN_ON = 0.5
+      # Nor does any fillet run on past the end of its own edge by more than
+      # this many radii to meet a neighbouring edge or plane (a long tail
+      # along that edge, e.g. where the next edge continues almost straight
+      # on): it ends square at its vertex and the corner is blended.
+      BEYOND_END = 1.0
       # Mitres between strips whose edges turn by less than ~35 degrees are
       # softened (curves made of short segments).
       SMOOTH_MITRE_COS = 0.82
@@ -120,6 +131,9 @@ module SimpleCorners
       HERMITE_LEN = 1.1
       TANGENT_WEIGHTS = [1.0, 0.75, 0.5, 0.25, 0.0].freeze
       MAX_FOLD_DEG = 45.0
+      # Mitred corners: ridges meet at real angles (about 90 degrees at a box
+      # corner); polygons this far apart are folded over each other.
+      SHARP_FOLD_DEG = 150.0
       CUSP_DEG = 35.0
       # Patches deviating less than this fraction of their size from a
       # plane are filled with a simple fan.
@@ -134,7 +148,7 @@ module SimpleCorners
       FAIR_ITER = 400
 
       attr_reader :points, :face_loops, :new_polys, :soft, :diagonals, :removed_edges, :trimmed_edges,
-                  :warnings, :reduced
+                  :warnings, :reduced, :mitre_fallbacks, :run_on_ids, :capped
 
       # opts: :mode (:round, :sharp, :bevel), :offset (Float > 0),
       #       :segments (Integer, ignored for bevel),
@@ -154,11 +168,22 @@ module SimpleCorners
         @segs = @mode == :bevel ? 1 : [[segs, 1].max, 64].min
         @segs = 2 if @mode == :sharp && @segs < 2
         @fmt = opts[:format] || lambda { |x| format('%.4g', x) }
+        # Smallest distance the host keeps two points apart (SketchUp: 0.001";
+        # 0: none). Features smaller than that are not built.
+        @merge_dist = opts[:merge_dist].to_f
         # Tuning/testing knobs (not exposed in the UI).
         @force_general = opts[:force_general]
         @apex_reach = opts[:apex_reach] || APEX_REACH
         @hermite_len = opts[:hermite_len] || HERMITE_LEN
         @warnings = []
+        # Corners of two fillets at a sharp edge built as a plain mitre at a
+        # point between their points on that edge (radius tapers a little).
+        @mitre_fallbacks = []
+        # Corners where a fillet ends square instead of sticking out (capped).
+        @capped = []
+        # Points of the ends of fillets that run on past a mitre (they lie on
+        # that fillet, flat on the other fillet's face).
+        @run_on_ids = []
         # Check-only run (used while searching for radii that fit): skips
         # the corner patches and stops after the checks.
         @check_only = opts[:check_only] ? true : false
@@ -546,25 +571,31 @@ module SimpleCorners
           fi = fs[i]
           if sel[ia] && !sel[ib]
             g = V.dot(dirs[ib], uin.call(fi, es[ia]))
-            if g > EPS_DIR
-              cand[ib] << [ds[ia] / g, g, es[ia]]
+            if g > EPS_DIR && ds[ia] / g * V.dot(dirs[ib], dirs[ia]) >= -BEYOND_END * ds[ia]
+              cand[ib] << [ds[ia] / g, g, es[ia], i]
               hits[[i, ib]] = true
             end
           elsif sel[ib] && !sel[ia]
             g = V.dot(dirs[ia], uin.call(fi, es[ib]))
-            if g > EPS_DIR
-              cand[ia] << [ds[ib] / g, g, es[ib]]
+            if g > EPS_DIR && ds[ib] / g * V.dot(dirs[ia], dirs[ib]) >= -BEYOND_END * ds[ib]
+              cand[ia] << [ds[ib] / g, g, es[ib], i]
               hits[[i, ia]] = true
             end
           end
         end
+        # Each offset line ends where it crosses the edge, so every fillet
+        # keeps its radius along its whole length. When the offset lines of
+        # the selected edges on both sides of an unselected edge cross it at
+        # different points (e.g. edges meeting it at different angles), the
+        # edge is cut back to the farther one (q) and the corner patch takes
+        # the straight piece between the two (qf: the point of each face).
         q = Array.new(n)
+        qf = {}
         n.times do |j|
           next if cand[j].empty?
-          # Weighted by how cleanly each offset line crosses the edge.
-          wsum = cand[j].inject(0.0) { |acc, (_t, g)| acc + g * g }
-          t = cand[j].inject(0.0) { |acc, (tt, g)| acc + tt * g * g } / wsum
-          if t >= lens[j] - @tol
+          t = cand[j].map { |c3| c3[0] }.max
+          fit = t < lens[j] - @tol
+          unless fit
             # Does not fit: remember the corner and the edges whose offset
             # lines reach too far, continue with a stand-in.
             @viol[v] = true
@@ -573,8 +604,35 @@ module SimpleCorners
           end
           @trim_src[[es[j], v]] = cand[j].map { |c3| c3[2] }
           q[j] = new_point(V.add(pv, V.mul(dirs[j], t)))
+          cand[j].each do |tt, _g, _k, fi_idx|
+            # (points closer than the host keeps apart are one point)
+            near = !fit || (t - tt) <= [@tol, ds.max * 1e-6, @merge_dist * 2].max
+            qf[[j, fi_idx]] = near ? q[j] : new_point(V.add(pv, V.mul(dirs[j], tt)))
+          end
           @trim[[es[j], v]] = t
           @removed[es[j]] = true
+        end
+
+        # A selected edge that ends on a plane (all the other faces at the
+        # vertex are coplanar, e.g. a wall, whatever else is selected
+        # there): where one of its own faces carries on past the vertex
+        # (reflex corner, the face is also the side of the wall), the
+        # fillet runs on until it meets that plane instead of being squared
+        # off at the vertex. The offset line then ends on the line of the
+        # face's other edge, extended back through the vertex (a trim of
+        # that edge by another fillet lies on the other side of the vertex
+        # and stays). Returns that point, or nil.
+        to_plane = lambda do |i, is, io|
+          next nil if sel[io]
+          g = V.dot(dirs[io], uin.call(fs[i], es[is]))
+          next nil unless g < -EPS_DIR
+          others = (0...n).reject { |j| j == is || j == (is - 1) % n }.map { |j| V.norm(@faces[fs[j]][:normal]) }
+          next nil if others.empty? || others.any? { |nrm| V.len(V.cross(nrm, others[0])) > 1e-6 }
+          # the edge itself must leave that plane
+          next nil if V.dot(dirs[is], others[0]).abs < EPS_DIR
+          # (not far past the end of the edge: a tail)
+          next nil if ds[is] / g * V.dot(dirs[io], dirs[is]) < -BEYOND_END * ds[is]
+          V.add(pv, V.mul(dirs[io], ds[is] / g))
         end
 
         # Corner sequences C[i] for every face, in fan order (from edge i
@@ -591,18 +649,20 @@ module SimpleCorners
             c[i] = [m]
           elsif sel[ia]
             if hits[[i, ib]]
-              c[i] = [q[ib]]
+              own = qf[[ib, i]]
+              c[i] = own == q[ib] ? [q[ib]] : [own, q[ib]]
             else
               # Straight or reflex corner: offset point; the corner itself
               # is kept only if nothing cuts the other edge (fillet end cap).
-              p = new_point(V.add(pv, V.mul(uin.call(fi, es[ia]), ds[ia])))
+              p = new_point(to_plane.call(i, ia, ib) || V.add(pv, V.mul(uin.call(fi, es[ia]), ds[ia])))
               c[i] = q[ib] ? [p, q[ib]] : [p, v]
             end
           elsif sel[ib]
             if hits[[i, ia]]
-              c[i] = [q[ia]]
+              own = qf[[ia, i]]
+              c[i] = own == q[ia] ? [q[ia]] : [q[ia], own]
             else
-              p = new_point(V.add(pv, V.mul(uin.call(fi, es[ib]), ds[ib])))
+              p = new_point(to_plane.call(i, ib, ia) || V.add(pv, V.mul(uin.call(fi, es[ib]), ds[ib])))
               c[i] = q[ia] ? [q[ia], p] : [v, p]
             end
           else
@@ -618,6 +678,9 @@ module SimpleCorners
             end
           end
         end
+
+        # Two fillets meeting at a corner whose third edge stays sharp.
+        clipped = mitre_and_clip(v, n, sel, es, fs, dirs, lens, ds, q, qf, c, uin)
 
         # End profiles of the selected edges.
         profs = Array.new(n)
@@ -636,10 +699,30 @@ module SimpleCorners
           next unless sel[i]
           lid = c[(i - 1) % n].last
           rid = c[i].first
+          if clipped && clipped[i]
+            ids = clipped[i].first == lid ? clipped[i] : clipped[i].reverse
+            profs[i] = ids
+            mids[i] = pv
+            @end_prof[[es[i], v]] = [ids, fs[(i - 1) % n]]
+            (0...ids.size - 1).each { |j| @prof_seg[ekey(ids[j], ids[j + 1])] = true }
+            next
+          end
           shared = v
           mc = pv
           mitre = ends[[lid, rid].sort] > 1
-          if !mitre
+          cos_arc = nil
+          # The edge ends on a plane (all the other faces at the vertex are
+          # coplanar and both ends of the profile lie on them, e.g. a wall
+          # the edge runs into at any angle): the profile is the exact cut
+          # of the fillet by that plane, so it lies flat on it. Its middle
+          # point is the vertex, its sweep that of the fillet itself.
+          others = (0...n).reject { |j| j == i || j == (i - 1) % n }.map { |j| V.norm(@faces[fs[j]][:normal]) }
+          on_plane = !mitre && lid != rid && !others.empty? && others.all? do |nrm|
+            [lid, rid].all? { |id| V.dot(V.sub(@points[id], pv), nrm).abs <= @ptol }
+          end
+          if on_plane
+            cos_arc = V.dot(uin.call(fs[(i - 1) % n], es[i]), uin.call(fs[i], es[i]))
+          elsif !mitre
             mid = V.lerp(@points[lid], @points[rid], 0.5)
             # Clamped to the edge: a middle point behind the vertex would
             # make the profile bulge out of the solid.
@@ -653,7 +736,7 @@ module SimpleCorners
               shared = nil
             end
           end
-          ids = lid == rid ? [lid] : profile(lid, rid, mc, shared)
+          ids = lid == rid ? [lid] : profile(lid, rid, mc, shared, cos_arc)
           profs[i] = ids
           mids[i] = mc
           @end_prof[[es[i], v]] = [ids, fs[(i - 1) % n]]
@@ -691,15 +774,158 @@ module SimpleCorners
         sidx.each { |i| @removed[es[i]] = true }
       end
 
+      # Two selected edges at a corner of three faces whose third edge (j)
+      # stays sharp: their fillets meet in a mitre. Where their offset lines
+      # cross the sharp edge at different points (the edges meet it at
+      # different angles), one fillet runs on past the mitre: each of its
+      # lines (parallel to its edge) runs on until it meets the other
+      # fillet's other face, so its end lies flat on that face, from the
+      # point P where the other fillet touches that face up to its own point
+      # on the sharp edge; the sharp edge is cut there. The other fillet
+      # ends at the mitre, from the shared face to P. Which fillet runs on
+      # is the one whose lines reach the other one's tangent line near the
+      # corner. Exact for chamfers (straight lines); for round fillets the
+      # mitre is the usual shared profile. If neither does (unusual
+      # shapes), both end at a point between on the sharp edge (a plain
+      # mitre). Returns {edge index => profile ids from the shared face to
+      # the other face} and puts the new corner points in c, or nil.
+      def mitre_and_clip(v, n, sel, es, fs, dirs, lens, ds, q, qf, c, uin)
+        return nil unless n == 3 && sel.count(true) == 2
+        j = sel.index(false)
+        fa = (j - 1) % n # face between edges j - 1 and j
+        fb = j # face between edges j and j + 1
+        oa = qf[[j, fa]]
+        ob = qf[[j, fb]]
+        return nil unless q[j] && oa && ob && oa != ob
+        sf = (j + 1) % n # the shared face, between edges j + 1 and j - 1
+        m = c[sf][0]
+        pv = @points[v]
+        # [own face, other face, own edge, other edge, own point on j]
+        ways = [[fa, fb, (j - 1) % n, (j + 1) % n, oa], [fb, fa, (j + 1) % n, (j - 1) % n, ob]]
+        ways.sort_by! { |w| -V.dist(@points[w[4]], pv) }
+        far = ways[0]
+        near = ways[1]
+        stick_out = V.dist(@points[far[4]], pv) - V.dist(@points[near[4]], pv)
+        if stick_out > MAX_RUN_ON * ds[far[2]]
+          return nil if cap_far(v, pv, j, fa, far, near, fs, es, dirs, ds, c, uin)
+        end
+        ways.each_with_index do |(cf, of, ce, oe, qc), wi|
+          qo = @points[ways[1 - wi][4]] # the other fillet's point on the sharp edge
+          res = run_on(pv, fs[sf], fs[cf], fs[of], es[ce], es[oe], dirs[ce], dirs[oe], lens[oe], ds[ce], ds[oe], uin, qo)
+          next unless res
+          pp, fp, on_o = res
+          pid = new_point(pp)
+          nc = [((1.0 - fp) * @segs).round, 1].max
+          flat = (1...nc).map { |k| new_point(on_o.call(fp + (1.0 - fp) * k / nc)) }
+          mit = @segs <= 1 ? [m, pid] : profile(m, pid, pv, v)
+          o_seq = [qc] + flat.reverse + [pid] # from the sharp edge to P
+          c[of] = of == fb ? o_seq : o_seq.reverse
+          c[cf] = [qc]
+          @trim[[es[j], v]] = V.dist(@points[qc], pv)
+          @run_on_ids.concat(flat + [qc, pid])
+          return { ce => mit + flat + [qc], oe => mit }
+        end
+        return nil if cap_far(v, pv, j, fa, far, near, fs, es, dirs, ds, c, uin)
+        # Plain mitre at the point between (only where the square end does
+        # not fit: an acute corner of the face).
+        @mitre_fallbacks << v
+        t = (V.dist(@points[oa], pv) + V.dist(@points[ob], pv)) / 2.0
+        qm = new_point(V.add(pv, V.mul(dirs[j], t)))
+        c[fa] = [qm]
+        c[fb] = [qm]
+        @trim[[es[j], v]] = t
+        nil
+      end
+
+      # The fillet that reaches the sharp edge j further (far) ends square at
+      # the vertex: its face is cut by the offset point at the vertex and the
+      # other fillet's point on j, and the corner between the two fillets is
+      # blended (a corner patch). Only where the face's corner is obtuse, so
+      # that point lies inside the face. Returns true if done.
+      def cap_far(v, pv, j, fa, far, near, fs, es, dirs, ds, c, uin)
+        ff, nf, fe, = far
+        qn = near[4]
+        return false unless V.dot(dirs[j], dirs[fe]) < -EPS_DIR
+        p = new_point(V.add(pv, V.mul(uin.call(fs[ff], es[fe]), ds[fe])))
+        c[ff] = ff == fa ? [p, qn] : [qn, p]
+        c[nf] = [qn]
+        @trim[[es[j], v]] = V.dist(@points[qn], pv)
+        @capped << v
+        true
+      end
+
+      # The fillet of edge ce (faces: shared sf, own cf) running on until
+      # its lines meet the plane of face of (the other fillet's other face).
+      # Returns [P, its fraction along the fillet's section, lambda giving
+      # the point on that plane for a fraction], or nil if no line meets it
+      # on the other fillet's offset line within the other edge (qo: where
+      # that line meets the sharp edge).
+      def run_on(pv, sf, cf, of, ce, oe, d, d_o, len_o, r, r_o, uin, qo)
+        nw = V.norm(@faces[of][:normal])
+        dn = V.dot(nw, d)
+        return nil if dn.abs < 1e-9
+        sl = V.add(pv, V.mul(uin.call(sf, ce), r))
+        sj = V.add(pv, V.mul(uin.call(cf, ce), r))
+        on_o = lambda do |f|
+          x = profile_point(sl, pv, sj, f)
+          V.add(x, V.mul(d, V.dot(nw, V.sub(pv, x)) / dn))
+        end
+        uw = uin.call(of, oe)
+        h = lambda { |f| V.dot(V.sub(on_o.call(f), pv), uw) - r_o }
+        f0 = 0.0
+        f1 = 1.0
+        return nil unless h.call(f0) < 0.0 && h.call(f1) > 0.0
+        60.times do
+          fm = (f0 + f1) / 2.0
+          if h.call(fm) < 0.0
+            f0 = fm
+          else
+            f1 = fm
+          end
+        end
+        fp = (f0 + f1) / 2.0
+        pp = on_o.call(fp)
+        # P lies on the other fillet's tangent line, from where that line
+        # meets the sharp edge (the plain mitre) on along the other edge.
+        return nil unless V.dot(V.sub(pp, qo), d_o) > -(@tol + r_o * 1e-9)
+        return nil unless V.dot(V.sub(pp, pv), d_o) < len_o - @tol
+        [pp, fp, on_o]
+      end
+
+      # Point at fraction f (by angle) of the profile from l to r with
+      # middle (control) point m; see profile_coords.
+      def profile_point(l, m, r, f)
+        a = V.sub(l, m)
+        b = V.sub(r, m)
+        la = V.len(a)
+        lb = V.len(b)
+        cosa = (la > 0.0 && lb > 0.0) ? V.dot(a, b) / (la * lb) : -1.0
+        cosa = [[cosa, 1.0].min, -1.0].max
+        theta = (Math::PI - Math.acos(cosa)) / 2.0
+        return V.lerp(l, r, f) if theta < 1e-6 || @segs <= 1
+        w = Math.cos(theta)
+        u = Math.tan(theta * (2.0 * f - 1.0) / 2.0) / Math.tan(theta / 2.0)
+        t = (u + 1.0) / 2.0
+        b0 = (1.0 - t)**2
+        b1 = 2.0 * t * (1.0 - t) * w
+        b2 = t * t
+        den = b0 + b1 + b2
+        V.add(m, V.add(V.mul(a, b0 / den), V.mul(b, b2 / den)))
+      end
+
       # Rational quadratic profile from l to r with middle (control) point m.
       # Exact circle when |l - m| == |r - m|; points evenly spaced by angle.
-      def profile_coords(l, m, r, nseg)
+      # cos_arc: cosine of the angle between the legs of the profile this one
+      # is a slanted cut of (a fillet cut by a plane that is not square to
+      # its edge); the points then lie on the fillet's own segment lines.
+      def profile_coords(l, m, r, nseg, cos_arc = nil)
         return [l, r] if nseg <= 1
         a = V.sub(l, m)
         b = V.sub(r, m)
         la = V.len(a)
         lb = V.len(b)
         cosa = (la > 0.0 && lb > 0.0) ? V.dot(a, b) / (la * lb) : -1.0
+        cosa = cos_arc if cos_arc
         cosa = 1.0 if cosa > 1.0
         cosa = -1.0 if cosa < -1.0
         theta = (Math::PI - Math.acos(cosa)) / 2.0 # half of the arc sweep
@@ -727,13 +953,13 @@ module SimpleCorners
       # Profile ids from lid to rid. Profiles whose middle point is the
       # vertex itself are cached so two edges meeting at a mitre share the
       # very same points.
-      def profile(lid, rid, mc, shared)
+      def profile(lid, rid, mc, shared, cos_arc = nil)
         if shared
           lo, hi = lid < rid ? [lid, rid] : [rid, lid]
           key = [lo, hi, shared]
           ids = @prof_cache[key]
           unless ids
-            cs = profile_coords(@points[lo], mc, @points[hi], @segs)
+            cs = profile_coords(@points[lo], mc, @points[hi], @segs, cos_arc)
             ids = [lo] + cs[1..-2].map { |x| new_point(x) } + [hi]
             @prof_cache[key] = ids
           end
@@ -1520,6 +1746,7 @@ module SimpleCorners
       def sharp_fill(es, dirs, profs, c, src)
         n = es.size
         nseg = @segs
+        start = @new_polys.size
         return false unless profs.all? { |pr| pr && pr.size == nseg + 1 }
         ppts = profs.map { |ids| ids.map { |id| @points[id] } }
         eps = @offset * 1e-6
@@ -1648,10 +1875,36 @@ module SimpleCorners
             end
           end
         end
+        # Polygons folded over each other (ridges crossing): not a mitre the
+        # strips can make; the caller blends the corner instead.
+        if poly_fold(polys) > SHARP_FOLD_DEG
+          @new_polys.slice!(start..-1)
+          return false
+        end
         boundary = {}
         n.times { |i| (0...profs[i].size - 1).each { |j| boundary[ekey(profs[i][j], profs[i][j + 1])] = true } }
         mark_soft_polys(polys, boundary, true, ridges)
         true
+      end
+
+      # Largest angle (degrees) between the normals of two polygons sharing an
+      # edge (consistently wound): about 180 where they fold over each other.
+      def poly_fold(polys)
+        nrm = polys.map { |ids| V.norm(V.newell(ids.map { |k| @points[k] })) }
+        owners = Hash.new { |h, k| h[k] = [] }
+        polys.each_with_index do |ids, pi|
+          ids.each_index { |i| owners[ekey(ids[i], ids[(i + 1) % ids.size])] << pi }
+        end
+        worst = 0.0
+        owners.each_value do |l|
+          next unless l.size == 2
+          a = nrm[l[0]]
+          o = nrm[l[1]]
+          next if V.len(a) == 0.0 || V.len(o) == 0.0
+          ang = Math.acos([[V.dot(a, o), 1.0].min, -1.0].max) * 180.0 / Math::PI
+          worst = ang if ang > worst
+        end
+        worst
       end
 
       # Distance along the ray p - a * t (t >= 0) to the extension of a strip
@@ -1969,11 +2222,131 @@ module SimpleCorners
           fa = @edge_faces[k][0]
           pa = oriented_profile(k, a, fa)
           pb = oriented_profile(k, b, fa)
+          if pa.size != pb.size && pa.size > 1 && pb.size > 1
+            zip_strip(pa, pb, fa, k)
+            next
+          end
           nseg = [pa.size, pb.size].max - 1
           pa = [pa[0]] * (nseg + 1) if pa.size == 1
           pb = [pb[0]] * (nseg + 1) if pb.size == 1
           nseg.times { |j| add_poly([pa[j], pa[j + 1], pb[j + 1], pb[j]], fa) }
           (1...nseg).each { |j| @soft[ekey(pa[j], pb[j])] = true }
+        end
+        soften_mitres if @mode == :round
+      end
+
+      # Round mode: where two fillets meet in a mitre (the third edge at
+      # the corner stays sharp), the line between their strips is smooth,
+      # as everywhere else on a rounded surface. A fillet's end against an
+      # original face keeps its line.
+      def soften_mitres
+        owners = Hash.new(0)
+        @new_polys.each do |pl|
+          next unless pl[:kind] == :strip
+          ids = pl[:ids]
+          ids.each_index { |i| owners[ekey(ids[i], ids[(i + 1) % ids.size])] += 1 }
+        end
+        owners.each { |e, n| @soft[e] = true if n == 2 && @prof_seg[e] }
+      end
+
+      # Strip between two end profiles with different numbers of points (an
+      # end that runs on past a mitre, its lines clipped by the other
+      # fillet, has more). The lines across (rungs) never cross; of all such
+      # sets, the one whose rungs join points closest together seen along
+      # the edge (in the fillet's cross-section), so each rung runs along
+      # the fillet, not across it: the strip cannot twist (a rung from one
+      # side of the section to the other made it dip inward). The choice
+      # does not depend on which end or profile comes first. Between two
+      # places both ends share (the lines of the fillet's facets) the
+      # stretch is one polygon if flat, exactly that facet; others are
+      # triangles. A flat strip (chamfer) is one polygon.
+      def zip_strip(pa, pb, src, edge)
+        all = (pa + pb).map { |id| @points[id] }
+        if planar?(all, @ptol)
+          add_poly(pa + pb.reverse, src)
+          return
+        end
+        org = @points[edge[0]]
+        u = V.norm(V.sub(@points[edge[1]], org))
+        flat = lambda do |id|
+          p = V.sub(@points[id], org)
+          V.sub(p, V.mul(u, V.dot(p, u)))
+        end
+        fa = pa.map(&flat)
+        fb = pb.map(&flat)
+        na = pa.size
+        nb = pb.size
+        # rung cost: apart in the section; a tiny share of the 3D length
+        # settles exact ties the same way from either end
+        cost = lambda do |i, k|
+          V.dist(fa[i], fb[k]) + 1e-6 * V.dist(@points[pa[i]], @points[pb[k]])
+        end
+        best = Array.new(na) { Array.new(nb) }
+        from = Array.new(na) { Array.new(nb) }
+        na.times do |i|
+          nb.times do |k|
+            here = cost.call(i, k)
+            if i == 0 && k == 0
+              best[i][k] = here
+              next
+            end
+            up = i > 0 ? best[i - 1][k] : nil
+            left = k > 0 ? best[i][k - 1] : nil
+            if left.nil? || (up && up <= left)
+              best[i][k] = up + here
+              from[i][k] = :a
+            else
+              best[i][k] = left + here
+              from[i][k] = :b
+            end
+          end
+        end
+        path = []
+        i = na - 1
+        k = nb - 1
+        until i == 0 && k == 0
+          path << from[i][k]
+          from[i][k] == :a ? i -= 1 : k -= 1
+        end
+        path.reverse!
+        same = lambda { |x, y| V.dist(fa[x], fb[y]) <= @ptol }
+        gi = 0
+        gk = 0
+        steps = []
+        path.each_with_index do |s, n|
+          steps << s
+          s == :a ? i += 1 : k += 1
+          last = n == path.size - 1
+          next unless last || same.call(i, k)
+          zip_stretch(pa, pb, gi, gk, steps, src)
+          @soft[ekey(pa[i], pb[k])] = true unless last
+          gi = i
+          gk = k
+          steps = []
+        end
+      end
+
+      # One stretch of zip_strip, from rung (gi, gk) to the next shared
+      # place: one polygon if flat, else triangles following steps.
+      def zip_stretch(pa, pb, gi, gk, steps, src)
+        ei = gi + steps.count(:a)
+        ek = gk + steps.count(:b)
+        poly = pa[gi..ei] + pb[gk..ek].reverse
+        if planar?(poly.map { |id| @points[id] }, @ptol)
+          add_poly(poly, src)
+          return
+        end
+        i = gi
+        k = gk
+        steps.each_with_index do |s, n|
+          if s == :a
+            add_poly([pa[i], pa[i + 1], pb[k]], src)
+            i += 1
+          else
+            add_poly([pa[i], pb[k + 1], pb[k]], src)
+            k += 1
+          end
+          @soft[ekey(pa[i], pb[k])] = true if n < steps.size - 1
         end
       end
 

@@ -160,6 +160,7 @@ module SimpleCorners
         result = {}
         @out.each { |p| result[p] = face_loops(p) }
         snap(result)
+        split_tees(result)
         check_closed(result)
         result
       end
@@ -410,7 +411,7 @@ module SimpleCorners
               out.concat(junction(v, p, qp, qn))
             end
           end
-          out = dedupe(out)
+          out = drop_spurs(dedupe(out))
           raise Error, 'not recognised (a rebuilt face would have no area).' if out.size < 3
           old = vs.map { |v| @pts[v] }
           so = V.dot(V.newell(old), n)
@@ -431,6 +432,69 @@ module SimpleCorners
         pts.each { |q| out << q if out.empty? || V.dist(out.last, q) > @merge }
         out.pop while out.size > 1 && V.dist(out.last, out.first) <= @merge
         out
+      end
+
+      # Removes points where the outline turns straight back on itself (a
+      # corner that moved along an edge of the face leaves the old end of
+      # that edge sticking out).
+      def drop_spurs(pts)
+        out = pts
+        loop do
+          n = out.size
+          return out if n < 3
+          i = (0...n).find do |j|
+            u = V.sub(out[j - 1], out[j])
+            w = V.sub(out[(j + 1) % n], out[j])
+            V.dot(u, w) > 0.0 && V.len(V.cross(u, w)) <= @merge * [V.len(u), V.len(w)].max
+          end
+          return out unless i
+          out = dedupe(out[0...i] + out[(i + 1)..-1])
+        end
+      end
+
+      # A corner of one rebuilt face that lies on an edge of another (the
+      # sharp edge ends on an edge that runs on past it): that edge gets
+      # the point too, so both faces share the same edges.
+      def split_tees(result)
+        all = result.values.flatten(2).uniq
+        result.each_key do |p|
+          result[p] = result[p].map do |lp|
+            out = []
+            lp.each_index do |i|
+              a = lp[i]
+              b = lp[(i + 1) % lp.size]
+              out << a
+              d = V.sub(b, a)
+              len = V.len(d)
+              next if len <= @merge
+              u = V.mul(d, 1.0 / len)
+              mid = all.select do |q|
+                t = V.dot(V.sub(q, a), u)
+                t > @merge && t < len - @merge && V.dist(q, V.add(a, V.mul(u, t))) <= @merge
+              end
+              out.concat(mid.sort_by { |q| V.dot(V.sub(q, a), u) })
+            end
+            out
+          end
+        end
+      end
+
+      # v lies on the edge between two faces in one plane, and that edge
+      # runs within the plane of the third face (e.g. the end of a rounded
+      # edge on a wall whose face is divided right there): v stays.
+      def stays_on_edge?(v, labs)
+        pos = @pts[v]
+        labs.combination(2).any? do |a, b|
+          next false unless coplanar?(a, b)
+          c = (labs - [a, b])[0]
+          nc, dc = @planes[c]
+          next false if (V.dot(nc, pos) - dc).abs > @plane_tol
+          (@face_edges[a] & @face_edges[b]).any? do |k|
+            next false unless k.include?(v) && @edge_faces[k].size == 2
+            d = V.sub(@pts[k[1]], @pts[k[0]])
+            V.len(d) > @tol && V.dot(nc, V.norm(d)).abs < 1e-4
+          end
+        end
       end
 
       # Corner point(s) of face p at region vertex v between the areas of
@@ -459,6 +523,7 @@ module SimpleCorners
         raise Error, 'not recognised (unclear corner).' if k < 3
         pos = @pts[v]
         if k == 3
+          return { :point => pos } if stays_on_edge?(v, labs)
           x = meet(labs)
           raise Error, 'not recognised (faces around a corner are parallel).' unless x
           near!(x, pos)

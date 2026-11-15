@@ -22,7 +22,9 @@ release/NOTES.md                  text of the current GitHub release
 test/                             engine tests, mock SketchUp API, SketchUp-side tests
 test/dev/                         quality scripts (stress, folds, dents, dome, convexity,
                                   fuzz = random crash hunt, fuzz_revert / fuzz_revert_mock =
-                                  revert round trips, fuzz_partial_mock = partial revert)
+                                  revert round trips, fuzz_partial_mock = partial revert,
+                                  fuzz_corners = two fillets at a sharp edge: tilted-top
+                                  prisms, tilted-floor pockets)
 scripts/build_rbz.sh              builds dist/simple_corners_v<version>.rbz from src/
 scripts/check_ruby22.rb           checks Ruby 2.2 (SketchUp 2017) compatibility
 scripts/preview_case.rb           runs a test solid and writes an OBJ
@@ -81,10 +83,34 @@ edges. For each end vertex of a selected edge:
        no fold.
      - **mitred:** strips extended along their edges. The ridges are their
        exact intersections (ray against swept profile) and meet at an apex.
-       Where that is not possible, the corner gets the round-mode blend,
-       outlined by hard edges.
+       Where that is not possible, or the polygons would fold over each
+       other (neighbours more than `SHARP_FOLD_DEG` apart), the corner gets
+       the round-mode blend, outlined by hard edges.
      - **bevel:** a flat polygon, or a fan if not planar.
-4. Each selected edge then gets a strip between its two end profiles. Each
+   - **two selected edges at a corner whose third edge stays sharp:** the
+     fillets meet in a mitre; where their offset lines cross the sharp edge
+     at different points, one fillet runs on past the mitre, each of its
+     lines running on until it meets the other fillet's face, so its end lies
+     flat on that face (exact for chamfers). A run-on is limited: where the
+     far fillet would stick out more than `MAX_RUN_ON` radii beyond the
+     other one (edges meeting the sharp edge at a shallow angle), and the
+     face corner is obtuse, the far fillet ends square at the vertex
+     instead and the corner patch blends the step. The same square end
+     replaces the plain mitre where neither fillet can run on; only at
+     acute face corners is a plain mitre at a point between left (small
+     taper, `Engine#mitre_fallbacks`).
+   - **no fillet runs past the end of its own edge** by more than
+     `BEYOND_END` radii (offset lines meeting an unselected edge or an end
+     plane at a shallow angle): it ends square there instead of making a
+     spike along that edge.
+4. Each selected edge then gets a strip between its two end profiles. Where
+   the ends have different numbers of points (a run-on end), the rungs
+   (non-crossing) are chosen to join points closest together in the
+   fillet's cross-section (seen along the edge), so the strip cannot twist,
+   whichever end comes first; stretches between places both ends share are
+   single flat polygons where flat (`zip_strip`). The test
+   helper `MeshHelpers.section_depth` cuts each strip at mid-edge and checks
+   the section stays on the fillet (also in `fuzz_corners`). Each
    affected face gets its loops rebuilt, and new polygons are oriented to
    match their neighbours.
 
