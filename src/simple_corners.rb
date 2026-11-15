@@ -11,7 +11,7 @@ require 'sketchup.rb'
 require 'extensions.rb'
 
 module SimpleCorners
-  VERSION = '1.2.2'.freeze
+  VERSION = '1.2.3'.freeze
   CREDITS = 'Vibecoded by Tomasz "bzqp" Dzieduszyński using Claude Opus 5.5, 2026'.freeze
 
   unless file_loaded?(__FILE__)

@@ -101,13 +101,31 @@ module SimpleCorners
       d = inst.definition
       done[d] = true
       ents = d.entities
-      warnings = process(ents, ents.grep(Sketchup::Edge), opts)
+      edges = ents.grep(Sketchup::Edge)
+      # A level with nothing to round (loose flat faces, only nested
+      # objects) is passed over, so its nested objects still get done.
+      warnings = []
+      if edges.any? { |e| usable_edge?(e) }
+        warnings = process(ents, edges, opts)
+        done[:processed] = true
+      end
       nested = ents.to_a.select { |e| e.valid? && (e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)) }
       nested.each do |e|
         sub = opts.merge(:offset => opts[:offset] / SimpleCorners.scale_of(e.transformation))
         warnings.concat(process_instance(e, sub, done, depth + 1))
       end
+      if depth == 0 && !done[:processed]
+        raise Core::Error, 'No edge can be processed. Edges must border exactly two non-coplanar faces.'
+      end
       warnings
+    end
+
+    # An edge the engine can round: between two faces that are not
+    # coplanar (the engine's own test).
+    def self.usable_edge?(e)
+      fs = e.faces
+      return false unless fs.size == 2 && fs[0] != fs[1]
+      Core::V.len(Core::V.cross(Core::V.norm(fs[0].normal.to_a), Core::V.norm(fs[1].normal.to_a))) >= 1e-6
     end
 
     # Attribute dictionary on the faces this extension creates (op id, mode,
@@ -313,6 +331,25 @@ module SimpleCorners
       [pts]
     end
 
+    # Whether 2D loop a lies inside 2D loop b (loops that do not cross,
+    # but may touch): tested at the first point of a's outline, corner or
+    # edge middle, that is not on b's outline.
+    def self.loop_inside?(a, b)
+      n = a.size
+      cand = a + (0...n).map { |i| [(a[i][0] + a[(i + 1) % n][0]) / 2.0, (a[i][1] + a[(i + 1) % n][1]) / 2.0] }
+      q = cand.find { |c| (0...b.size).all? { |i| seg_dist2d(c, b[i], b[(i + 1) % b.size]) > MIN_DIST } }
+      q ? inside2d?(q, b) : false
+    end
+
+    # Distance from 2D point q to segment ab.
+    def self.seg_dist2d(q, a, b)
+      dx = b[0] - a[0]
+      dy = b[1] - a[1]
+      dd = dx * dx + dy * dy
+      t = dd > 0 ? [[((q[0] - a[0]) * dx + (q[1] - a[1]) * dy) / dd, 0.0].max, 1.0].min : 0.0
+      Math.hypot(q[0] - a[0] - t * dx, q[1] - a[1] - t * dy)
+    end
+
     # A point inside a 2D polygon (the middle of a corner triangle that
     # lies in it), or nil.
     def self.point_inside(poly)
@@ -349,16 +386,20 @@ module SimpleCorners
       ax = newell(simple.max_by { |lp| newell(lp).length.to_f }).to_a.map(&:abs)
       keep = [0, 1, 2] - [ax.index(ax.max)]
       flat = simple.map { |lp| lp.map { |p| p.to_a.values_at(*keep) } }
-      inner = flat.map { |pl| point_inside(pl) }
-      return nil if inner.any?(&:nil?)
-      depth = flat.each_index.map { |k| flat.each_index.count { |o| o != k && inside2d?(inner[k], flat[o]) } }
+      # within[k][o]: loop k lies inside loop o. The loops do not cross, so
+      # one point of k's outline that is not on o's tells. (A point inside
+      # k would not do: in a thin ring it can lie in the hole.)
+      within = flat.each_index.map do |k|
+        flat.each_index.map { |o| o != k && loop_inside?(flat[k], flat[o]) }
+      end
+      depth = flat.each_index.map { |k| within[k].count(true) }
       area = simple.map { |lp| newell(lp).length.to_f }
       faces = []
       flat.each_index.select { |k| depth[k].even? }.each do |k|
         holes = flat.each_index.select do |h|
-          next false unless depth[h] == depth[k] + 1 && inside2d?(inner[h], flat[k])
+          next false unless depth[h] == depth[k] + 1 && within[h][k]
           # the smallest outline around it is its own
-          flat.each_index.none? { |o| o != k && depth[o] == depth[k] && area[o] < area[k] && inside2d?(inner[h], flat[o]) }
+          flat.each_index.none? { |o| o != k && depth[o] == depth[k] && area[o] < area[k] && within[h][o] }
         end
         f = face_with_holes(ents, [simple[k]] + holes.map { |h| simple[h] }, &blk)
         return nil unless f
@@ -381,7 +422,12 @@ module SimpleCorners
         g.erase!
         return nil
       end
-      loops[1..-1].each { |lp| add_face(ge, lp) }
+      # A hole SketchUp refuses would leave the face covering it, with
+      # open edges around it: then the face is not made at all.
+      unless loops[1..-1].all? { |lp| add_face(ge, lp) }
+        g.erase!
+        return nil
+      end
       # Either of two faces may be the piece inside the hole: tell them
       # apart by where they lie.
       ax = newell(loops[0]).to_a.map(&:abs)
@@ -392,12 +438,21 @@ module SimpleCorners
         x.erase! if q && holes.any? { |h| inside2d?(q, h) }
       end
       left = ge.grep(Sketchup::Face)
-      if left.empty?
+      # Every hole must be open: no face left covers a point inside it.
+      if left.empty? || holes.any? { |h| (q = point_inside(h)).nil? || left.any? { |x| covers?(x, q, keep) } }
         g.erase!
         return nil
       end
       left.each { |x| yield x } if block_given?
       (g.explode || []).grep(Sketchup::Face).max_by(&:area)
+    end
+
+    # Whether face f covers the 2D point q (inside its outline, not in a
+    # hole of it).
+    def self.covers?(f, q, keep)
+      f.loops.all? do |lp|
+        inside2d?(q, lp.vertices.map { |v| v.position.to_a.values_at(*keep) }) == lp.outer?
+      end
     end
 
     # A point inside face f, in 2D (the coordinates keep): the middle of

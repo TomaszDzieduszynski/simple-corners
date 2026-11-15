@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.3
+
+- If SketchUp refuses to cut a hole in a rebuilt face, the operation now
+  stops and the model stays as it was (the face used to cover the hole,
+  leaving open edges around it).
+- A thin ring-shaped face whose outline is joined to its hole could fail
+  to be rebuilt; it is now made correctly.
+- A selected group holding loose flat faces next to nested groups or
+  components: the nested objects are now rounded (it stopped with "No edge
+  can be processed").
+- README: the radius is measured along each face from the edge; it equals
+  the arc's radius only where the faces meet at 90°.
+
 ## 1.2.2
 
 - A rounding or revert that cannot be finished no longer damages the

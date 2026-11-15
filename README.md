@@ -6,7 +6,7 @@ faces with holes.
 
 ## [⬇ Download Simple Corners (simple_corners.rbz)](https://github.com/TomaszDzieduszynski/simple-corners/releases/latest/download/simple_corners.rbz)
 
-Version 1.2.2 · SketchUp 2017 or newer · Windows and Mac · free and open
+Version 1.2.3 · SketchUp 2017 or newer · Windows and Mac · free and open
 source · signed by SketchUp's extension signing service
 
 ![The three tools on the same L-shaped block](docs/images/tools.png)
@@ -49,7 +49,8 @@ The tools work like SketchUp's own Circle and Offset tools.
    Shift+click toggles (Option instead of Ctrl on Mac). What will change is
    shown in orange.
 2. **Set the radius with two clicks:** the distance between the two points
-   is the radius (for Bevel: the chamfer size). A red outline previews the
+   is the radius (for Bevel: the chamfer size). It is measured along each
+   face, from the edge to where the rounding starts (see *Good to know*). A red outline previews the
    result while you move the mouse.
 3. **Or type it:** after the first click, type a length (`12`, `5mm`,
    `1.5cm`) and press Enter. Before the first click, a number sets the
@@ -64,7 +65,13 @@ do.
 - **Radius too large for some edges?** The tools shrink it only on the edges
   where it does not fit, so nothing breaks. A notice tells you how many
   edges were reduced.
-- **Radius is exact,** with one rare exception: two rounded edges meet a
+- **The radius is measured along the faces:** the rounding starts that
+  distance from the edge on each face, so it lines up with the preview and
+  with Bevel. Where the faces meet square (90°), this is also the radius of
+  the arc. At other angles the arc is a true circle tangent to both faces,
+  but its radius differs: smaller at sharp edges (at a 60° edge, 1" gives
+  an arc of radius 0.577"), larger at blunt ones.
+- **That distance is kept exactly,** with one rare exception: two rounded edges meet a
   third edge that stays sharp, at different heights on it (sloping or
   skewed faces), and one face's corner there is narrower than 90°. Neither
   fillet can then end cleanly on the other, so they meet halfway, and near

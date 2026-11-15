@@ -982,6 +982,50 @@ class TestUnround < Minitest::Test
     assert_equal 1, faces.size
   end
 
+  # A ring whose outline is joined to its hole by an out-and-back
+  # diagonal edge. A point inside the outer square (the middle of a corner
+  # triangle) lies in the hole, so nesting is decided on the outlines.
+  def test_thin_ring_with_a_connector_becomes_a_face_with_a_hole
+    ring = [[0, 0], [10, 0], [10, 10], [0, 10], [0, 0], [1, 1], [1, 9], [9, 9], [9, 1], [1, 1]]
+    f = SimpleCorners::Bridge.add_face(model.entities, ring.map { |x, y| pt(x, y, 0) })
+    refute_nil f
+    assert_equal [4, 4], f.loops.map { |l| l.vertices.size }.sort
+    assert(f.loops.reject(&:outer?).first.vertices.all? { |v| (1..9).cover?(v.position.x) }, 'inner square is the hole')
+    assert_equal 1, faces.size
+  end
+
+  # SketchUp refusing a hole: the face is not made (it would cover the
+  # hole and leave open edges around it) and nothing is left behind.
+  def test_refused_hole_makes_no_face
+    sq = lambda { |a, b| [[a, a], [b, a], [b, b], [a, b]].map { |x, y| pt(x, y, 0) } }
+    f = refuse_face(2) { SimpleCorners::Bridge.face_with_holes(model.entities, [sq.call(0, 10), sq.call(3, 7)]) }
+    assert_nil f
+    assert_empty model.entities.to_a
+    refute_nil SimpleCorners::Bridge.face_with_holes(model.entities, [sq.call(0, 10), sq.call(3, 7)])
+  end
+
+  # A group with a loose flat face (nothing to round) and a nested solid:
+  # the nested solid is still rounded.
+  def test_group_level_with_nothing_to_round_is_passed_over
+    g = model.entities.add_group
+    g.entities.add_face([pt(20, 0, 0), pt(30, 0, 0), pt(30, 10, 0), pt(20, 10, 0)])
+    c = g.entities.add_group
+    M.box.then { |m| m.faces.each { |f| c.entities.add_face(f[:loops][0].map { |i| Geom::Point3d.new(*m.points[i]) }) } }
+    model.selection.add(g)
+    assert SimpleCorners.apply(:round, 1.0, true), UI.messages.inspect
+    assert(c.entities.grep(Sketchup::Edge).all? { |e| e.faces.size == 2 })
+    assert_operator c.entities.grep(Sketchup::Face).size, :>, 6
+    assert_equal 1, g.entities.grep(Sketchup::Face).size
+  end
+
+  # Nothing to round anywhere in a selected group: still an error.
+  def test_group_with_nothing_to_round_is_refused
+    g = model.entities.add_group
+    g.entities.add_face([pt(0, 0, 0), pt(10, 0, 0), pt(10, 10, 0), pt(0, 10, 0)])
+    model.selection.add(g)
+    refute SimpleCorners.apply(:round, 1.0, true)
+  end
+
   # Everything in the model, by position (faces and edges with their faces).
   def snapshot
     ents = model.entities
