@@ -20,6 +20,9 @@
 module SimpleCorners
   module Unround
     class Error < StandardError; end
+    # Partial revert impossible because the group was stretched unevenly
+    # after rounding: reported, not replaced by another method.
+    class Stretched < Error; end
 
     V = Core::V
     # Side faces must meet at least at this angle (shallow corners such as
@@ -140,6 +143,8 @@ module SimpleCorners
       if net.size > faces.size
         begin
           return prepare_partial(faces, net)
+        rescue Stretched
+          raise
         rescue Error, Resharpen::Error
           nil # try the selection on its own
         end
@@ -244,9 +249,27 @@ module SimpleCorners
       sharp = owned.keys.select { |i| frac.call(i) >= 0.5 }
       sharp = [owned.keys.max_by { |i| frac.call(i) }] if sharp.empty?
       again = owned.keys - sharp
+      # A stored radius counts only if it was measured at today's scale (the
+      # group may have been scaled since; then the geometry is measured).
+      # Faces from before 1.2.4 have no scale stored: taken as unscaled.
+      here = Bridge.context_metric(Sketchup.active_model)
+      # Stretched unevenly since: the other roundings are no longer the same
+      # on both sides and cannot be made again as they are (the model stays
+      # unchanged; reverting the whole surface still works).
+      unless again.empty?
+        uneven = again.flat_map { |i| owned[i] }.any? do |f|
+          f.get_attribute(Bridge::DICT, 'op') &&
+            !Bridge.uniform_change?(f.get_attribute(Bridge::DICT, 'metric') || Bridge.metric(nil), here)
+        end
+        if uneven
+          raise Stretched, 'the group was stretched unevenly after rounding, so the other edges cannot be ' \
+                           'rounded again as they are. Revert the whole surface, or undo the stretch first.'
+        end
+      end
       stored = lambda do |fs|
-        rs = fs.map { |f| f.get_attribute(Bridge::DICT, 'radius') }.compact
-        rs.empty? ? nil : rs.max_by { |x| rs.count(x) }.to_f
+        rs = fs.select { |f| Bridge.same_metric?(f.get_attribute(Bridge::DICT, 'metric') || Bridge.metric(nil), here) }
+               .map { |f| f.get_attribute(Bridge::DICT, 'radius') }.compact
+        rs.empty? ? nil : most_common(rs).to_f
       end
       reround = again.map do |i|
         [segs[i][0], segs[i][1], measured_offset(segs[i], owned[i], sides[i], stored.call(owned[i]))]
@@ -255,10 +278,11 @@ module SimpleCorners
       net.each { |f| m = f.get_attribute(Bridge::DICT, 'mode'); modes[m.to_sym] += 1 if m }
       tagged = lambda do |key|
         vals = net.map { |f| f.get_attribute(Bridge::DICT, key) }.compact
-        vals.empty? ? nil : vals.max_by { |x| vals.count(x) }
+        vals.empty? ? nil : most_common(vals)
       end
       counts = again.map { |i| segment_count(segs[i], owned[i]) }.compact
-      counts = [tagged.call('segments').to_i] if tagged.call('segments')
+      tagged_segs = tagged.call('segments')
+      counts = [tagged_segs.to_i] if tagged_segs
       mode = modes.empty? ? (counts.max.to_i <= 1 ? :bevel : :round) : modes.max_by { |_m, n| n }[0]
       # smoothed: most edges inside the network are soft (without smoothing
       # only the diagonals of split faces are)
@@ -266,9 +290,17 @@ module SimpleCorners
       net.each { |f| nset[f] = true }
       inner = net.flat_map(&:edges).compact.uniq.select { |e| e.faces.all? { |g| nset[g] } }
       smooth = inner.count(&:soft?) * 2 > inner.size
-      smooth = tagged.call('smooth') unless tagged.call('smooth').nil?
+      tagged_smooth = tagged.call('smooth')
+      smooth = tagged_smooth unless tagged_smooth.nil?
       { :kind => :partial, :faces => net, :data => rebuild, :reround => reround, :mode => mode,
         :segments => counts.empty? ? Settings.segments : counts.max, :smooth => smooth }
+    end
+
+    # The most frequent value (the first seen of equally frequent ones).
+    def self.most_common(vals)
+      n = Hash.new(0)
+      vals.each { |v| n[v] += 1 }
+      n.max_by { |_v, c| c }[0]
     end
 
     def self.seg_dist(p, a, b)
@@ -354,7 +386,8 @@ module SimpleCorners
       end
       op_id = format('%d-%06d', Time.now.to_i, rand(1_000_000))
       opts = { :mode => job[:mode], :offset => offsets.values.max, :segments => job[:segments],
-               :smooth => job[:smooth], :edge_offsets => offsets, :op_id => op_id }
+               :smooth => job[:smooth], :edge_offsets => offsets, :op_id => op_id,
+               :metric => Bridge.context_metric(Sketchup.active_model) }
       begin
         Bridge.process(ents, offsets.keys, opts)
       rescue Core::Error, Bridge::Error => err
@@ -606,7 +639,7 @@ module SimpleCorners
         loops = new_loops(f, run, pts)
         check_loop(loops[0], plane_of(f))
         data[f] = { :loops => loops, :material => f.material, :back_material => f.back_material,
-                    :layer => f.layer, :normal => f.normal.to_a }
+                    :layer => f.layer, :normal => f.normal.to_a, :identity => Bridge.identity_of(f) }
       end
       caps.each { |pts| check_loop(pts, [V.norm(V.newell(pts)), pts[0]]) }
       (data.values.flat_map { |d| d[:loops] } + caps).each { |lp| check_points(lp) }
@@ -695,6 +728,7 @@ module SimpleCorners
           nf = Bridge.add_face_loops(te, d[:loops].map { |lp| lp.map(&gp) }) do |x|
             x.reverse! if x.normal.dot(Geom::Vector3d.new(*d[:normal])) < 0
             copy_attrs(x, d)
+            Bridge.give_identity(x, d[:identity])
           end
           raise Error, 'a face could not be rebuilt.' unless nf
         end
@@ -730,7 +764,11 @@ module SimpleCorners
       ents.erase_entities(erase.select(&:valid?))
       Bridge.drop_stray_edges(old_edges, te)
       guard.erase! if guard.valid?
-      (tmp.explode || []).grep(Sketchup::Face)
+      begin
+        Bridge.explode_new(tmp)
+      rescue Bridge::Error => err
+        raise Error, err.message
+      end
     end
 
     # Reverts a whole network (Resharpen): the faces around the surface get
@@ -771,7 +809,7 @@ module SimpleCorners
       res.map do |fi, lps|
         f = local[fi]
         { :old => f, :loops => lps, :material => f.material, :back_material => f.back_material,
-          :layer => f.layer, :normal => f.normal.to_a }
+          :layer => f.layer, :normal => f.normal.to_a, :identity => Bridge.identity_of(f) }
       end
     end
 
@@ -801,6 +839,7 @@ module SimpleCorners
           nf = Bridge.add_face_loops(te, d[:loops].map { |lp| lp.map(&gp) }) do |x|
             x.reverse! if x.normal.dot(Geom::Vector3d.new(*d[:normal])) < 0
             copy_attrs(x, d)
+            Bridge.give_identity(x, d[:identity])
           end
           raise Error, 'a face could not be rebuilt.' unless nf
           newf[d[:old]] = nf

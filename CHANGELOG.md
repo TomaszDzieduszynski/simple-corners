@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.2.4
+
+- Groups and components scaled unevenly (e.g. stretched along one axis)
+  were rounded with the average of their scales, giving ovals of the wrong
+  size. The radius is now measured in the model in every direction, also
+  in nested groups, and the preview matches.
+- With several groups selected, one with nothing to round (e.g. only a
+  flat face) could stop the whole operation, depending on the selection
+  order. Now the operation stops only when nothing in the selection can be
+  rounded.
+- A face trimmed by a rounding or a revert keeps its hidden state and its
+  attributes (data stored by other extensions); the new faces of the
+  rounding do not copy them.
+- If SketchUp cannot place the new faces in the model, the operation now
+  stops and the model stays as it was (it used to report success with the
+  old faces already removed).
+- Revert of part of a rounded surface after the group was scaled: the
+  other edges are rounded again at their real size (they could shrink or
+  grow to the radius used before the scaling). If the group was stretched
+  unevenly since, their roundings are no longer the same on both sides and
+  cannot be made again as they are: reverting part of the surface is then
+  refused with a message (reverting the whole surface still works).
+- With several groups selected, the preview no longer says "No edge can
+  be processed" because one of them has nothing to round.
+- Scaled groups far from the origin, or at very small or very large
+  scales, are handled with full precision (a valid bevel could fail).
+- Locked groups and components are left as they are, also inside a
+  selected group (they used to be rounded). Selecting only locked ones
+  says so.
+- Faces with very many outline points (e.g. around a finely divided
+  circular hole) are now fully checked for offset lines crossing each
+  other; above 600 points the check was skipped.
+- The live preview could keep showing an earlier radius after a quick
+  mouse movement while a click applied the current one.
+- Faster preview (the outline was computed twice), faster revert of large
+  rounded surfaces, and a drawing limit that also holds for one very large
+  group.
+- Extension Warehouse requirements: the files are loaded with
+  Sketchup.require (an encrypted copy loads too), and warnings no longer
+  print to the Ruby Console.
+
 ## 1.2.3
 
 - If SketchUp refuses to cut a hole in a rebuilt face, the operation now

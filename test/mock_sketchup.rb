@@ -247,8 +247,14 @@ module Sketchup
     '17.0.18899'
   end
 
+  # SketchUp's require: the path without its file extension (.rb/.rbe).
+  def self.require(path)
+    raise ArgumentError, "Sketchup.require takes the path without .rb: #{path}" if path =~ /\.rb[es]?\z/
+    Kernel.require(path)
+  end
+
   def self.register_extension(ext, _load)
-    require ext.loader + '.rb'
+    Kernel.require(ext.loader + '.rb')
     true
   end
 
@@ -279,6 +285,49 @@ module Sketchup
 
     def hidden?
       @hidden ? true : false
+    end
+
+    # Dictionaries by name (pairs in @attrs, nested dictionaries in @dkids).
+    def attribute_dictionaries
+      return nil if (@attrs || {}).empty?
+      @attrs.map { |n, pairs| AttributeDictionary.new(n, pairs, ((@dkids ||= {})[n] ||= {})) }
+    end
+
+    def attribute_dictionary(name, create = false)
+      pairs = (@attrs ||= {})[name] || (create ? (@attrs[name] = {}) : nil)
+      pairs && AttributeDictionary.new(name, pairs, ((@dkids ||= {})[name] ||= {}))
+    end
+  end
+
+  class AttributeDictionary
+    attr_reader :name
+
+    def initialize(name, pairs, kids)
+      @name = name
+      @pairs = pairs
+      @kids = kids
+    end
+
+    def each_pair(&blk)
+      @pairs.each_pair(&blk)
+    end
+
+    def [](k)
+      @pairs[k]
+    end
+
+    def []=(k, v)
+      @pairs[k] = v
+    end
+
+    def attribute_dictionaries
+      return nil if @kids.empty?
+      @kids.map { |n, (pairs, kids)| AttributeDictionary.new(n, pairs, kids) }
+    end
+
+    def attribute_dictionary(name, create = false)
+      e = @kids[name] || (create ? (@kids[name] = [{}, {}]) : nil)
+      e && AttributeDictionary.new(name, e[0], e[1])
     end
   end
 
@@ -633,11 +682,22 @@ module Sketchup
     end
 
     def active_entities
-      @entities
+      @open_path && !@open_path.empty? ? @open_path.last.entities : @entities
     end
 
     def active_path
-      nil
+      @open_path && !@open_path.empty? ? @open_path : nil
+    end
+
+    # Test helper: groups open for editing, and the placement SketchUp
+    # reports for them (Model#edit_transform). Positions stay local here.
+    def open_for_test(path, edit_tr = nil)
+      @open_path = path
+      @edit_tr = edit_tr
+    end
+
+    def edit_transform
+      @edit_tr || Geom::Transformation.new
     end
 
     def start_operation(name, _disable = false)
@@ -690,7 +750,21 @@ module Sketchup
     end
 
     def transformation
-      Geom::Transformation.new
+      @transformation || Geom::Transformation.new
+    end
+
+    # Test helper: placement in the parent (the geometry is not moved).
+    attr_writer :transformation
+
+    attr_writer :locked
+
+    def locked?
+      @locked ? true : false
+    end
+
+    # Test helper: explode fails (SketchUp returns false, the group stays).
+    class << self
+      attr_accessor :fail_explode
     end
 
     def bounds
@@ -707,6 +781,7 @@ module Sketchup
     # Moves the group's faces (with their holes) into its owner; returns
     # the new entities.
     def explode
+      return false if Group.fail_explode
       out = []
       entities.grep(Face).each do |f|
         nf = @owner.add_face(f.outer_loop.vertices.map(&:position))
@@ -721,6 +796,8 @@ module Sketchup
         nf.back_material = f.back_material
         nf.layer = f.layer
         nf.instance_variable_set(:@attrs, f.instance_variable_get(:@attrs))
+        nf.instance_variable_set(:@dkids, f.instance_variable_get(:@dkids))
+        nf.hidden = f.hidden
         out << nf
         out.concat(nf.edges)
       end

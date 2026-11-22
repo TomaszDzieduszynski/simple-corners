@@ -383,6 +383,9 @@ module SimpleCorners
       end
       rkey = [r, Settings.segments, @mode, Settings.smooth?]
       if rkey == @res_key
+        # shown already: a delayed update for an earlier radius must not
+        # replace it
+        @pending_r = nil
         compose_preview
         return
       end
@@ -392,6 +395,7 @@ module SimpleCorners
         compose_preview
         return
       end
+      @pending_r = nil
       warm = @last_r && r >= @last_r && @warm_mode == @mode ? @warm : nil
       t0 = Time.now.to_f
       @result = SimpleCorners.preview_result(@model, @mode, r, warm)
@@ -413,8 +417,10 @@ module SimpleCorners
       return if @timer
       @timer = UI.start_timer(THROTTLE, false) do
         @timer = nil
-        next unless @active
-        refresh_preview(@pending_r, true)
+        want = @pending_r
+        # nil: a newer radius was shown meanwhile
+        next unless @active && want
+        refresh_preview(want, true)
         update_ui
         @model.active_view.invalidate
       end

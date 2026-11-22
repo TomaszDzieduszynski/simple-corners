@@ -109,6 +109,39 @@ class TestBridge < Minitest::Test
     assert_nil model.tool_history.last, 'should return to the Select tool'
   end
 
+  # A delayed preview update (slow preview, quick mouse) must not replace a
+  # newer one: radius 1, then 2 (delayed), then back to 1 (shown at once).
+  def test_delayed_preview_does_not_bring_back_an_older_radius
+    model.selection.add(build(M.box))
+    tool = new_tool(:bevel)
+    tool.send(:refresh_preview, 1.0)
+    one = tool.instance_variable_get(:@preview)[:hard].map(&:to_a)
+    slow = lambda do
+      tool.instance_variable_set(:@last_cost, 1.0)
+      tool.instance_variable_set(:@last_at, Time.now.to_f)
+    end
+    slow.call
+    n = UI.timers.size
+    tool.send(:refresh_preview, 2.0) # delayed
+    assert_equal n + 1, UI.timers.size
+    tool.send(:refresh_preview, 1.0) # shown already
+    UI.timers.last.call
+    assert_equal one, tool.instance_variable_get(:@preview)[:hard].map(&:to_a)
+    # the same after a radius computed at once while the update waits
+    slow.call
+    tool.send(:refresh_preview, 2.0) # delayed
+    tool.instance_variable_set(:@last_at, Time.now.to_f - 10)
+    tool.send(:refresh_preview, 1.5) # at once
+    want = SimpleCorners.preview(model, :bevel, 1.5)[:hard].map(&:to_a)
+    UI.timers.last.call
+    assert_equal want, tool.instance_variable_get(:@preview)[:hard].map(&:to_a)
+    # a delayed update with nothing newer still arrives
+    slow.call
+    tool.send(:refresh_preview, 2.0)
+    UI.timers.last.call
+    assert_equal SimpleCorners.preview(model, :bevel, 2.0)[:hard].map(&:to_a), tool.instance_variable_get(:@preview)[:hard].map(&:to_a)
+  end
+
   def test_preselection_typed_radius
     faces = build(M.box)
     model.selection.add(faces)
@@ -1024,6 +1057,465 @@ class TestUnround < Minitest::Test
     g.entities.add_face([pt(0, 0, 0), pt(10, 0, 0), pt(10, 10, 0), pt(0, 10, 0)])
     model.selection.add(g)
     refute SimpleCorners.apply(:round, 1.0, true)
+  end
+
+  # --- 1.2.4: review fixes -------------------------------------------
+
+  def box_in(ents, m = M.box)
+    m.faces.each { |f| ents.add_face(f[:loops][0].map { |i| Geom::Point3d.new(*m.points[i]) }) }
+  end
+
+  # Placement scaled by sx, sy, sz (negative: mirrored), then moved by t.
+  def placed(sx, sy, sz, t = [0, 0, 0], w = 1.0)
+    Geom::Transformation.new([sx.to_f, 0, 0, 0, 0, sy.to_f, 0, 0, 0, 0, sz.to_f, 0, t[0].to_f, t[1].to_f, t[2].to_f, w])
+  end
+
+  # The face lying in the plane axis = value (local coordinates).
+  def face_at(ents, axis, value)
+    ents.grep(Sketchup::Face).find { |f| f.vertices.all? { |v| (v.position.to_a[axis] - value).abs < 1e-6 } }
+  end
+
+  def span(f, axis)
+    xs = f.vertices.map { |v| v.position.to_a[axis] }
+    [xs.min.round(6), xs.max.round(6)]
+  end
+
+  # Closed, and every face facing away from the middle of the 10" box.
+  def sound_box?(ents)
+    return false unless ents.grep(Sketchup::Edge).all? { |e| e.faces.size == 2 }
+    ents.grep(Sketchup::Face).all? do |f|
+      c = M::V.avg(f.vertices.map { |v| v.position.to_a })
+      M::V.dot(f.normal.to_a, M::V.sub(c, [5, 5, 5])) > 0
+    end
+  end
+
+  # Bevel of 1" (model) on a 10" box in a group whose local inch is
+  # (kx, ky, kz) inches in the model: the faces are cut back 1/k locally.
+  def assert_bevel_in_model_units(ents, kx, ky, kz)
+    assert sound_box?(ents)
+    top = face_at(ents, 2, 10)
+    assert_equal [1.0 / kx, 10 - 1.0 / kx].map { |x| x.round(6) }, span(top, 0)
+    assert_equal [1.0 / ky, 10 - 1.0 / ky].map { |x| x.round(6) }, span(top, 1)
+    front = face_at(ents, 1, 0)
+    assert_equal [1.0 / kz, 10 - 1.0 / kz].map { |x| x.round(6) }, span(front, 2)
+  end
+
+  def faces_tagged(ents)
+    ents.grep(Sketchup::Face).select { |f| f.get_attribute('SimpleCorners', 'op') }
+  end
+
+  def top_front_edge
+    model.entities.grep(Sketchup::Edge).find do |x|
+      x.start.position.z == 10 && x.end.position.z == 10 && x.start.position.y == 0 && x.end.position.y == 0
+    end
+  end
+
+  # Review (1.2.3): a group stretched along X got the average of its
+  # scales (1.5" x 0.75" instead of 1"). The radius is now measured in the
+  # model, and the preview shows the same.
+  def test_stretched_group_is_bevelled_in_model_units
+    g = model.entities.add_group
+    box_in(g.entities)
+    g.transformation = placed(2, 1, 1, [100, 0, 0])
+    model.selection.add(g)
+    pv = SimpleCorners.preview(model, :bevel, 1.0)
+    assert_nil pv[:error]
+    refute_empty pv[:hard]
+    pv[:hard].each do |p|
+      assert_includes [100.0, 101.0, 119.0, 120.0], p.x.to_f.round(6), p.to_a.inspect
+      assert_includes [0.0, 1.0, 9.0, 10.0], p.y.to_f.round(6), p.to_a.inspect
+      assert_includes [0.0, 1.0, 9.0, 10.0], p.z.to_f.round(6), p.to_a.inspect
+    end
+    assert SimpleCorners.apply(:bevel, 1.0, true), UI.messages.inspect
+    assert_bevel_in_model_units(g.entities, 2, 1, 1)
+    assert_equal [1.0], faces_tagged(g.entities).map { |f| f.get_attribute('SimpleCorners', 'radius') }.uniq
+  end
+
+  # The rounded vertical edge of a group stretched along X is a true
+  # circle of 1" in the model (not an oval).
+  def test_stretched_group_is_rounded_with_circles
+    g = model.entities.add_group
+    box_in(g.entities)
+    g.transformation = placed(2, 1, 1)
+    model.selection.add(g)
+    assert SimpleCorners.apply(:round, 1.0, true), UI.messages.inspect
+    assert sound_box?(g.entities)
+    arc = g.entities.grep(Sketchup::Face).flat_map(&:vertices).uniq.map { |v| v.position.to_a }
+    # the end profile of the vertical strip, where the corner patch starts
+    arc = arc.select { |x, y, z| (z - 9).abs < 1e-6 && 2 * x <= 1 + 1e-9 && y <= 1 + 1e-9 }
+    assert_equal 7, arc.size
+    arc.each { |x, y, _z| assert_in_delta 1.0, Math.hypot(2 * x - 1, y - 1), 1e-6, [x, y].inspect }
+  end
+
+  def test_mirrored_stretched_group_is_bevelled_in_model_units
+    g = model.entities.add_group
+    box_in(g.entities)
+    g.transformation = placed(-2, 1, 1, [100, 0, 0])
+    model.selection.add(g)
+    assert SimpleCorners.apply(:bevel, 1.0, true), UI.messages.inspect
+    assert_bevel_in_model_units(g.entities, 2, 1, 1)
+  end
+
+  # Scales of nested groups multiply: (1, 2, 1) holding (2, 1, 1).
+  def test_nested_scaled_groups_are_bevelled_in_model_units
+    outer = model.entities.add_group
+    outer.transformation = placed(1, 2, 1)
+    inner = outer.entities.add_group
+    inner.transformation = placed(2, 1, 1)
+    box_in(inner.entities)
+    model.selection.add(outer)
+    assert SimpleCorners.apply(:bevel, 1.0, true), UI.messages.inspect
+    assert_bevel_in_model_units(inner.entities, 2, 2, 1)
+  end
+
+  # SketchUp before 2018 can keep a uniform scale in the last element.
+  def test_uniform_scale_kept_in_the_last_element
+    g = model.entities.add_group
+    box_in(g.entities)
+    g.transformation = placed(1, 1, 1, [0, 0, 0], 0.5)
+    model.selection.add(g)
+    assert SimpleCorners.apply(:bevel, 1.0, true), UI.messages.inspect
+    assert_bevel_in_model_units(g.entities, 2, 2, 2)
+  end
+
+  def test_space_only_for_scaled_placements
+    sp = SimpleCorners::Bridge::Space
+    assert_nil sp.for(Geom::Transformation.new)
+    assert_nil sp.for(placed(-1, 1, 1, [5, 6, 7]))
+    c = Math.cos(0.3)
+    s = Math.sin(0.3)
+    assert_nil sp.for(Geom::Transformation.new([c, s, 0, 0, -s, c, 0, 0, 0, 0, 1.0, 0, 1, 2, 3, 1.0]))
+    st = sp.for(Geom::Transformation.new([2 * c, 2 * s, 0, 0, -s, c, 0, 0, 0, 0, 1.0, 0, 1, 2, 3, 1.0]))
+    refute_nil st
+    q = st.to_local(st.to_model([1.5, -2.0, 3.25]))
+    [1.5, -2.0, 3.25].each_with_index { |x, i| assert_in_delta x, q[i], 1e-12 }
+    n = st.normal([0, 0, 1])
+    [0, 0, 1].each_with_index { |x, i| assert_in_delta x, n[i], 1e-12 }
+  end
+
+  # Review (1.2.3): with a group holding only a flat face selected first,
+  # nothing was rounded; with the box group first, it was.
+  def test_selection_order_does_not_matter
+    counts = [true, false].map do |flat_first|
+      setup
+      flat = model.entities.add_group
+      flat.entities.add_face([[20, 0, 0], [30, 0, 0], [30, 10, 0], [20, 10, 0]].map { |x| Geom::Point3d.new(*x) })
+      solid = model.entities.add_group
+      box_in(solid.entities)
+      (flat_first ? [flat, solid] : [solid, flat]).each { |x| model.selection.add(x) }
+      assert SimpleCorners.apply(:round, 1.0, true), "flat first: #{flat_first} #{UI.messages.inspect}"
+      assert sound_box?(solid.entities)
+      assert_equal 1, flat.entities.grep(Sketchup::Face).size
+      solid.entities.grep(Sketchup::Face).size
+    end
+    assert_equal counts[0], counts[1]
+  end
+
+  # Loose edges that cannot be rounded do not stop a selected group.
+  def test_loose_flat_face_with_a_group_selected
+    f = model.entities.add_face([[20, 0, 0], [30, 0, 0], [30, 10, 0], [20, 10, 0]].map { |x| Geom::Point3d.new(*x) })
+    solid = model.entities.add_group
+    box_in(solid.entities)
+    model.selection.add(f)
+    model.selection.add(solid)
+    assert SimpleCorners.apply(:round, 1.0, true), UI.messages.inspect
+    assert sound_box?(solid.entities)
+  end
+
+  # Review (1.2.3): the trimmed face came back visible and without the
+  # data other extensions keep on it. It keeps both now (through Revert
+  # too); the new faces of the rounding get neither.
+  def test_trimmed_face_keeps_hidden_flag_and_attributes
+    build(M.box)
+    top = face_at(model.entities, 2, 10)
+    top.hidden = true
+    top.set_attribute('Customer', 'part_id', 1234)
+    top.attribute_dictionary('Customer', true).attribute_dictionary('Sub', true)['k'] = 'v'
+    model.selection.add(top_front_edge)
+    assert SimpleCorners.apply(:round, 2.0)
+    check = lambda do |tag|
+      f = face_at(model.entities, 2, 10)
+      assert f.hidden?, tag
+      assert_equal 1234, f.get_attribute('Customer', 'part_id'), tag
+      assert_equal 'v', f.attribute_dictionary('Customer').attribute_dictionary('Sub')['k'], tag
+    end
+    check.call('rounded')
+    refute_empty faces_tagged(model.entities)
+    faces_tagged(model.entities).each do |f|
+      refute f.hidden?
+      assert_nil f.get_attribute('Customer', 'part_id')
+    end
+    model.selection.clear
+    model.selection.add(new_surface(BOX_PLANES))
+    assert SimpleCorners::Unround.run, UI.messages.inspect
+    assert_equal 6, faces.size
+    check.call('reverted')
+    assert_equal 5, faces.count { |f| !f.hidden? }
+  end
+
+  # Review (1.2.3): SketchUp failing to explode the group of new faces
+  # (it returns false) was taken as success with no faces.
+  def test_failed_explode_aborts_round_and_revert
+    build(M.box)
+    model.selection.add(top_front_edge)
+    Sketchup::Group.fail_explode = true
+    begin
+      refute SimpleCorners.apply(:round, 2.0)
+      assert_equal [:abort], model.ops.last
+      assert_match(/could not place the new faces/, UI.messages.join(' '))
+    ensure
+      Sketchup::Group.fail_explode = false
+    end
+    setup
+    build(M.box)
+    model.selection.add(top_front_edge)
+    assert SimpleCorners.apply(:round, 2.0)
+    model.selection.clear
+    model.selection.add(new_surface(BOX_PLANES))
+    Sketchup::Group.fail_explode = true
+    begin
+      refute SimpleCorners::Unround.run
+      assert_equal [:abort], model.ops.last
+      assert_match(/could not place the new faces/, UI.messages.join(' '))
+    ensure
+      Sketchup::Group.fail_explode = false
+    end
+  end
+
+  # --- 1.2.4: second review ---------------------------------------------
+
+  def strip_with_normal(ents, n)
+    ents.grep(Sketchup::Face).find { |f| M::V.dist(f.normal.to_a, n) < 1e-6 }
+  end
+
+  # Review 2 (1.2.4): bevelled at 0.5x (1" in the model = 2" in the
+  # group), then the group set back to 1x: reverting one bevel re-made the
+  # others with the stored 1" instead of the 2" they have now.
+  def test_partial_revert_after_the_group_was_scaled
+    s2 = Math.sqrt(0.5)
+    g = model.entities.add_group
+    box_in(g.entities)
+    g.transformation = placed(0.5, 0.5, 0.5)
+    model.selection.add(g)
+    assert SimpleCorners.apply(:bevel, 1.0, true), UI.messages.inspect
+    bottom = strip_with_normal(g.entities, [0, -s2, -s2])
+    assert_equal [0.0, 2.0], span(bottom, 1)
+    g.transformation = Geom::Transformation.new
+    model.open_for_test([g])
+    model.selection.clear
+    model.selection.add(strip_with_normal(g.entities, [0, -s2, s2]))
+    assert SimpleCorners::Unround.run, UI.messages.inspect
+    bottom = strip_with_normal(g.entities, [0, -s2, -s2])
+    assert_equal [0.0, 2.0], span(bottom, 1), 'untouched bevel keeps its size'
+    assert_equal [0.0, 2.0], span(bottom, 2)
+    assert_nil strip_with_normal(g.entities, [0, -s2, s2]), 'the reverted bevel is gone'
+  end
+
+  # The scale is stored with the radius; same scale at revert: stored
+  # radius still used.
+  def test_radius_scale_stored_and_compared
+    g = model.entities.add_group
+    box_in(g.entities)
+    g.transformation = placed(2, 1, 1)
+    model.selection.add(g)
+    assert SimpleCorners.apply(:bevel, 1.0, true)
+    mt = faces_tagged(g.entities).map { |f| f.get_attribute('SimpleCorners', 'metric') }.uniq
+    assert_equal [[4.0, 0.0, 0.0, 1.0, 0.0, 1.0]], mt
+    br = SimpleCorners::Bridge
+    assert br.same_metric?(br.metric(placed(-2, 1, 1, [9, 9, 9])), mt[0]), 'moving and mirroring do not count'
+    refute br.same_metric?(br.metric(nil), mt[0])
+    model.open_for_test([g], placed(2, 1, 1))
+    assert br.same_metric?(br.context_metric(model), mt[0])
+  end
+
+  # Review 2 (1.2.4): a valid tiny scale was taken for zero size, and the
+  # preview raised an exception.
+  def test_tiny_scale_is_not_zero_size
+    g = model.entities.add_group
+    box_in(g.entities, M.box(1e7, 1e7, 1e7))
+    g.transformation = placed(1e-6, 1e-6, 1e-6)
+    model.selection.add(g)
+    pv = SimpleCorners.preview(model, :bevel, 1.0)
+    assert_nil pv[:error]
+    refute_empty pv[:hard]
+    assert SimpleCorners.apply(:bevel, 1.0, true), Sketchup.status.inspect
+    top = face_at(g.entities, 2, 1e7)
+    assert_equal [1e6, 9e6], span(top, 0)
+  end
+
+  # A group flattened to zero size: a clean message, also in the preview.
+  def test_zero_scale_is_reported_cleanly
+    g = model.entities.add_group
+    box_in(g.entities)
+    g.transformation = placed(1, 1, 0)
+    model.selection.add(g)
+    pv = SimpleCorners.preview(model, :bevel, 1.0)
+    assert_match(/zero size/, pv[:error].to_s)
+    refute SimpleCorners.apply(:bevel, 1.0, true)
+    assert_equal [:abort], model.ops.last
+  end
+
+  # Review 2 (1.2.4): a small scaled group far from the origin lost
+  # precision in the engine and its bevel failed.
+  def test_scaled_group_far_from_the_origin
+    [0.0, 20_000_000.9].each do |d|
+      setup
+      g = model.entities.add_group
+      box_in(g.entities, M.box(0.125, 0.125, 0.125))
+      g.transformation = placed(2, 2, 2, [d, d, d])
+      model.selection.add(g)
+      pv = SimpleCorners.preview(model, :bevel, 0.025)
+      assert_nil pv[:error], "at #{d}"
+      assert(pv[:hard].all? { |p| (p.x - d).abs <= 0.25 + 1e-6 }, "preview at #{d} drawn on the group")
+      assert SimpleCorners.apply(:bevel, 0.025, true), "at #{d}: #{Sketchup.status.last}"
+      top = face_at(g.entities, 2, 0.125)
+      assert_equal [0.0125, 0.1125], span(top, 0), "at #{d}"
+    end
+  end
+
+  # Review 3 (1.2.4): bevelled while stretched 2x along X, X set back to
+  # 1x: the other bevels are no longer the same on both sides and cannot be
+  # made again as they are. Partial revert is refused (model unchanged);
+  # reverting the whole surface still works.
+  def test_partial_revert_refused_after_an_uneven_stretch
+    s2 = Math.sqrt(0.5)
+    g = model.entities.add_group
+    box_in(g.entities)
+    g.transformation = placed(2, 1, 1)
+    model.selection.add(g)
+    assert SimpleCorners.apply(:bevel, 1.0, true), UI.messages.inspect
+    g.transformation = Geom::Transformation.new
+    model.open_for_test([g])
+    before = g.entities.grep(Sketchup::Face).map { |f| f.vertices.map { |v| v.position.to_a } }.sort
+    model.selection.clear
+    model.selection.add(strip_with_normal(g.entities, [0, -s2, s2]))
+    refute SimpleCorners::Unround.run
+    assert_match(/stretched unevenly/, UI.messages.join(' '))
+    assert_equal [:abort], model.ops.last
+    assert_equal before, g.entities.grep(Sketchup::Face).map { |f| f.vertices.map { |v| v.position.to_a } }.sort
+    UI.messages.clear
+    model.selection.clear
+    model.selection.add(faces_tagged(g.entities))
+    assert SimpleCorners::Unround.run, UI.messages.inspect
+    assert_equal 6, g.entities.grep(Sketchup::Face).size
+  end
+
+  def test_uniform_change
+    br = SimpleCorners::Bridge
+    assert br.uniform_change?(br.metric(placed(0.5, 0.5, 0.5)), br.metric(nil))
+    assert br.uniform_change?(br.metric(placed(2, 1, 1)), br.metric(placed(-4, 2, 2, [5, 5, 5])))
+    refute br.uniform_change?(br.metric(placed(2, 1, 1)), br.metric(nil))
+  end
+
+  # Review 3 (1.2.4): a flat-face group selected with a box group made the
+  # preview say "No edge can be processed" (applying worked).
+  def test_preview_of_a_mixed_selection
+    [true, false].each do |flat_first|
+      setup
+      flat = model.entities.add_group
+      flat.entities.add_face([[20, 0, 0], [30, 0, 0], [30, 10, 0], [20, 10, 0]].map { |x| Geom::Point3d.new(*x) })
+      solid = model.entities.add_group
+      box_in(solid.entities)
+      (flat_first ? [flat, solid] : [solid, flat]).each { |x| model.selection.add(x) }
+      pv = SimpleCorners.preview(model, :bevel, 1.0)
+      assert_nil pv[:error], "flat first #{flat_first}"
+      refute_empty pv[:hard]
+    end
+    setup
+    flat = model.entities.add_group
+    flat.entities.add_face([[20, 0, 0], [30, 0, 0], [30, 10, 0], [20, 10, 0]].map { |x| Geom::Point3d.new(*x) })
+    model.selection.add(flat)
+    assert_match(/No edge can be processed/, SimpleCorners.preview(model, :bevel, 1.0)[:error].to_s)
+  end
+
+  # Locked groups are left alone, as SketchUp's own tools do (its Ruby API
+  # would let the edit through).
+  def test_locked_group_is_left_alone
+    g = model.entities.add_group
+    box_in(g.entities)
+    g.locked = true
+    model.selection.add(g)
+    pv = SimpleCorners.preview(model, :bevel, 1.0)
+    assert_equal SimpleCorners::Bridge::LOCKED, pv[:error]
+    assert_empty pv[:hard]
+    refute SimpleCorners.apply(:bevel, 1.0)
+    assert_match(/locked/, UI.messages.last.to_s)
+    assert_equal 6, g.entities.grep(Sketchup::Face).size
+  end
+
+  def test_locked_child_of_a_group_is_left_alone
+    parent = model.entities.add_group
+    box_in(parent.entities)
+    child = parent.entities.add_group
+    box_in(child.entities)
+    child.transformation = placed(1, 1, 1, [50, 0, 0])
+    child.locked = true
+    model.selection.add(parent)
+    pv = SimpleCorners.preview(model, :bevel, 1.0)
+    assert_nil pv[:error]
+    refute_empty pv[:hard]
+    assert pv[:hard].all? { |q| q.x < 20 }, 'no outline on the locked child'
+    assert SimpleCorners.apply(:bevel, 1.0, true)
+    assert_operator parent.entities.grep(Sketchup::Face).size, :>, 6
+    assert_equal 6, child.entities.grep(Sketchup::Face).size
+    assert(Sketchup.status.any? { |m| m.to_s.include?(SimpleCorners::Bridge::LOCKED_SKIPPED) })
+  end
+
+  def test_locked_and_unlocked_selected_together
+    a = model.entities.add_group
+    box_in(a.entities)
+    b = model.entities.add_group
+    box_in(b.entities)
+    b.transformation = placed(1, 1, 1, [50, 0, 0])
+    b.locked = true
+    [b, a].each { |x| model.selection.add(x) }
+    assert SimpleCorners.apply(:bevel, 1.0, true)
+    assert_operator a.entities.grep(Sketchup::Face).size, :>, 6
+    assert_equal 6, b.entities.grep(Sketchup::Face).size
+  end
+
+  # The preview runs the engine once per fit step (it used to repeat the
+  # successful check run).
+  module CountRuns
+    class << self
+      attr_accessor :runs
+    end
+    def run
+      CountRuns.runs += 1 if CountRuns.runs
+      super
+    end
+  end
+  SimpleCorners::Core::Engine.prepend(CountRuns)
+
+  def test_preview_runs_the_engine_once
+    model.selection.add(build(M.box))
+    CountRuns.runs = 0
+    pv = SimpleCorners.preview(model, :round, 1.0)
+    runs = CountRuns.runs
+    CountRuns.runs = nil
+    refute_empty pv[:hard]
+    assert_equal 1, runs
+  end
+
+  # The drawing budget holds inside one large group too; the edge count
+  # stays complete.
+  def test_selection_drawing_budget_in_one_large_group
+    g = model.entities.add_group
+    n = 12_000
+    g.entities.add_face((0...n).map { |k| t = 2 * Math::PI * k / n; Geom::Point3d.new(100 * Math.cos(t), 100 * Math.sin(t), 0) })
+    model.selection.add(g)
+    d = SimpleCorners.selection_data(model)
+    assert_equal n, d[:edges]
+    assert_operator d[:sel].size, :<=, 20_000
+    assert_operator d[:sel].size, :>=, 19_998
+  end
+
+  def test_most_common_stored_value
+    u = SimpleCorners::Unround
+    assert_equal 2, u.most_common([2, 1, 1, 2])
+    assert_equal 1, u.most_common([2, 1, 1])
+    assert_equal true, u.most_common([true, false, true])
+    assert_in_delta 0.5, u.most_common([0.5] * 5000 + [0.25] * 4999), 0
   end
 
   # Everything in the model, by position (faces and edges with their faces).

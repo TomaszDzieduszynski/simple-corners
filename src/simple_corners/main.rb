@@ -14,11 +14,13 @@ module SimpleCorners
   file.force_encoding('UTF-8') if file.respond_to?(:force_encoding)
   PATH = File.dirname(file).freeze
 
-  require File.join(PATH, 'core.rb')
-  require File.join(PATH, 'bridge.rb')
-  require File.join(PATH, 'tool.rb')
-  require File.join(PATH, 'resharpen.rb')
-  require File.join(PATH, 'unround.rb')
+  # Sketchup.require without the file extension: also loads the files of
+  # an encrypted copy (.rbe), as the Extension Warehouse makes by default.
+  Sketchup.require File.join(PATH, 'core')
+  Sketchup.require File.join(PATH, 'bridge')
+  Sketchup.require File.join(PATH, 'tool')
+  Sketchup.require File.join(PATH, 'resharpen')
+  Sketchup.require File.join(PATH, 'unround')
 
   MODES = [:round, :sharp, :bevel].freeze
   MODE_NAMES = { :round => 'Round Edges', :sharp => 'Round Edges, Mitred', :bevel => 'Bevel Edges' }.freeze
@@ -105,17 +107,6 @@ module SimpleCorners
     Geom::Transformation.new
   end
 
-  # Average scale factor of a transformation (to convert a radius measured
-  # in the model into the units of a scaled group).
-  def self.scale_of(tr)
-    a = tr.to_a
-    sx = Math.sqrt(a[0]**2 + a[1]**2 + a[2]**2)
-    sy = Math.sqrt(a[4]**2 + a[5]**2 + a[6]**2)
-    sz = Math.sqrt(a[8]**2 + a[9]**2 + a[10]**2)
-    s = (sx + sy + sz) / 3.0
-    s > 0 ? s : 1.0
-  end
-
   # What the tools act on: edges of the open context (selected edges and
   # edges of selected faces) and whole groups/components, including the
   # groups and components nested in them (nested: true; applying a
@@ -126,7 +117,9 @@ module SimpleCorners
     e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)
   end
 
-  def self.targets(model)
+  # skipped: optional Hash, gets :locked (number of locked groups and
+  # components passed over, nested ones included).
+  def self.targets(model, skipped = nil)
     ctx = context_parent(model)
     ctx_tr = edit_transform(model)
     edges = {}
@@ -143,7 +136,7 @@ module SimpleCorners
     list = []
     list << Target.new(model.active_entities, edges.keys, ctx_tr, nil, false) unless edges.empty?
     seen = {}
-    insts.each { |inst| instance_targets(list, inst, ctx_tr, seen, false, 0) }
+    insts.each { |inst| instance_targets(list, inst, ctx_tr, seen, false, 0, skipped) }
     list
   end
 
@@ -151,9 +144,14 @@ module SimpleCorners
   # Copies of a group (Move + Ctrl) share one definition until one is
   # edited, so every group is a target of its own (it is made unique when
   # processed). A component definition is shared on purpose: it is
-  # processed once and every instance changes.
-  def self.instance_targets(list, inst, parent_tr, seen, nested, depth)
+  # processed once and every instance changes. Locked ones are left as
+  # they are, with everything in them (as SketchUp's own tools do).
+  def self.instance_targets(list, inst, parent_tr, seen, nested, depth, skipped = nil)
     return if depth > Bridge::MAX_DEPTH
+    if Bridge.locked?(inst)
+      skipped[:locked] = (skipped[:locked] || 0) + 1 if skipped
+      return
+    end
     d = inst.definition
     unless inst.is_a?(Sketchup::Group)
       return if seen[d]
@@ -162,7 +160,7 @@ module SimpleCorners
     tr = parent_tr * inst.transformation
     list << Target.new(d.entities, d.entities.grep(Sketchup::Edge), tr, inst, nested)
     d.entities.each do |e|
-      instance_targets(list, e, tr, seen, true, depth + 1) if instance?(e)
+      instance_targets(list, e, tr, seen, true, depth + 1, skipped) if instance?(e)
     end
   end
 
@@ -195,8 +193,9 @@ module SimpleCorners
     selection_overlay(model, res)
     targets(model).each do |t|
       res[:edges] += t.edges.size
-      next if res[:sel].size > 20_000
       t.edges.each do |e|
+        # drawing budget (the edge count above stays complete)
+        break if res[:sel].size >= 20_000
         a = e.start.position.transform(t.transform)
         b = e.end.position.transform(t.transform)
         res[:sel] << a << b
@@ -216,29 +215,42 @@ module SimpleCorners
   #   warm when previewing a larger radius (faster fitting).
   def self.preview_result(model, mode, radius, warm = nil)
     res = { :hard => [], :soft => [], :error => nil, :reduced => 0, :skipped => false, :warm => [] }
-    list = targets(model)
+    skipped = {}
+    list = targets(model, skipped)
     total = list.inject(0) { |acc, t| acc + t.edges.size }
+    if list.empty? && skipped[:locked]
+      res[:error] = Bridge::LOCKED
+      return res
+    end
     return res if total == 0 || radius.nil? || radius <= 0
     if total > PREVIEW_MAX_EDGES
       res[:skipped] = true
       return res
     end
+    tried = false
     list.each_with_index do |t, ti|
-      if t.edges.empty? # a group holding only other groups
+      # nothing to round here (a group holding only other groups, a flat
+      # face): passed over, as when applying
+      unless t.edges.any? { |e| Bridge.usable_edge?(e) }
         res[:warm] << nil
         next
       end
-      base = radius / scale_of(t.transform)
+      tried = true
+      base = radius
       start = nil
       if warm && warm[ti]
         start = {}
         warm[ti].each { |v, f| start[v] = f * base }
       end
-      opts = Settings.engine_opts(mode, base).merge(:refine => false, :max_steps => PREVIEW_FIT_STEPS,
-                                                    :start_offsets => start, :outline_only => true)
+      space = nil
       begin
+        # in model units (inside a scaled group too): see Bridge::Space
+        space = t.instance ? Bridge::Space.for(t.transform) : nil
+        opts = Settings.engine_opts(mode, base).merge(:refine => false, :max_steps => PREVIEW_FIT_STEPS,
+                                                      :start_offsets => start, :outline_only => true,
+                                                      :space => space)
         eng = Bridge.compute(t.edges, opts)[0]
-      rescue Core::Error => err
+      rescue Core::Error, Bridge::Error => err
         res[:error] = err.message
         res[:warm] << nil
         next
@@ -254,10 +266,16 @@ module SimpleCorners
       eng.reduced.each { |v, d| w[v] = d / base }
       res[:warm] << w
       pts = eng.points
+      # with space, the engine's points are scaled group coordinates: back
+      # to the group's own, then placed in the model like the group
       tr = t.transform
-      pt = lambda { |i| Geom::Point3d.new(pts[i][0], pts[i][1], pts[i][2]).transform(tr) }
+      pt = lambda do |i|
+        q = space ? space.to_local(pts[i]) : pts[i]
+        Geom::Point3d.new(q[0], q[1], q[2]).transform(tr)
+      end
       eng.outline_segments.each { |a, b| res[:hard] << pt.call(a) << pt.call(b) }
     end
+    res[:error] ||= (skipped[:locked] ? Bridge::LOCKED : Bridge::NOTHING_TO_ROUND) unless tried
     res
   end
 
@@ -295,9 +313,12 @@ module SimpleCorners
   # that does not fit (the tool shows it in the status bar instead).
   def self.apply(mode, radius, quiet = false)
     model = Sketchup.active_model
-    list = targets(model)
+    skipped = {}
+    list = targets(model, skipped)
     if list.empty?
-      UI.messagebox("#{MODE_NAMES[mode]}: select edges, faces, groups or components first.") unless quiet
+      msg = skipped[:locked] ? Bridge::LOCKED : 'select edges, faces, groups or components first.'
+      UI.messagebox("#{MODE_NAMES[mode]}: #{msg}") unless quiet
+      Sketchup.set_status_text("#{MODE_NAMES[mode]}: #{msg}", SB_PROMPT) if skipped[:locked]
       return false
     end
     est = estimate_faces(list, mode_segments(mode))
@@ -311,15 +332,22 @@ module SimpleCorners
     model.start_operation(MODE_NAMES[mode], true)
     begin
       done = {}
+      # The radius is measured in the model, inside scaled groups too.
+      opts = Settings.engine_opts(mode, radius).merge(:op_id => op_id)
       list.each do |t|
         next if t.nested # processed with the instance that holds it
-        opts = Settings.engine_opts(mode, radius / scale_of(t.transform)).merge(:op_id => op_id)
         if t.instance
-          warnings.concat(Bridge.process_instance(t.instance, opts, done))
-        else
-          warnings.concat(Bridge.process(t.entities, t.edges, opts))
+          warnings.concat(Bridge.process_instance(t.instance, opts, done, 0, t.transform))
+        elsif t.edges.any? { |e| Bridge.usable_edge?(e) }
+          warnings.concat(Bridge.process(t.entities, t.edges, opts.merge(:metric => Bridge.context_metric(model))))
+          done[:processed] = true
         end
       end
+      # Only when nothing in the whole selection could be rounded (the order
+      # of the selection does not matter).
+      locked = skipped[:locked] || done[:locked]
+      raise Core::Error, (locked ? Bridge::LOCKED : Bridge::NOTHING_TO_ROUND) unless done[:processed]
+      warnings << Bridge::LOCKED_SKIPPED if locked
       model.commit_operation
     rescue Core::Error, Bridge::Error => err
       model.abort_operation
@@ -352,7 +380,6 @@ module SimpleCorners
 
   # Non-blocking message (notification balloon where available).
   def self.notify(msg)
-    puts msg
     if defined?(UI::Notification) && defined?(EXTENSION) && EXTENSION
       UI::Notification.new(EXTENSION, msg).show
     else

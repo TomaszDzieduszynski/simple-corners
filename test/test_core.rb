@@ -494,4 +494,26 @@ class TestCore < Minitest::Test
       end
     end
   end
+
+  # Outlines above 600 points (two loops: 360,000 point pairs) used to skip
+  # the crossing checks; now a grid finds what the pairwise loops find.
+  def test_crossing_checks_on_large_outlines
+    eng = SimpleCorners::Core::Engine.allocate
+    eng.instance_variable_set(:@scale, 10.0)
+    circle = lambda { |n, r| (0...n).map { |k| t = 2 * Math::PI * k / n; [r * Math.cos(t), r * Math.sin(t)] } }
+    [600, 601, 3000].each do |n|
+      p = circle.call(n, 10)
+      assert_nil eng.send(:self_crossing, p), "n=#{n}"
+      p[n / 2] = [15.0, 0.3] # pulled across the circle
+      hit = eng.send(:self_crossing, p)
+      refute_nil hit, "n=#{n}"
+      assert_equal eng.send(:grid_crossing, p, p, true), hit
+    end
+    big = circle.call(700, 10)
+    hole = circle.call(700, 5)
+    assert_nil eng.send(:loops_crossing, big, hole)
+    hole[10] = [30.0, 3.0]
+    refute_nil eng.send(:loops_crossing, big, hole)
+  end
+
 end

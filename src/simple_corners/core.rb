@@ -207,10 +207,15 @@ module SimpleCorners
         last = nil
         (opts[:max_steps] || MAX_FIT_STEPS).times do
           begin
-            new(points, faces, sel, check.merge(:offsets => dv)).run
-            dv = refine_fit(points, faces, sel, check, dv, by_edge, at) unless opts[:refine] == false
-            eng = new(points, faces, sel, opts.merge(:offsets => dv, :check_only => opts[:outline_only] ? true : false))
+            eng = new(points, faces, sel, check.merge(:offsets => dv))
             eng.run
+            # The preview (outline only, no refining) needs nothing more: the
+            # check run is the outline it shows.
+            unless opts[:outline_only] && opts[:refine] == false
+              dv = refine_fit(points, faces, sel, check, dv, by_edge, at) unless opts[:refine] == false
+              eng = new(points, faces, sel, opts.merge(:offsets => dv, :check_only => opts[:outline_only] ? true : false))
+              eng.run
+            end
             eng.instance_variable_set(:@reduced, dv)
             return eng
           rescue OffsetError => err
@@ -2116,8 +2121,11 @@ module SimpleCorners
       end
 
       # Indices of a crossing pair of segments of two closed 2D polygons, or nil.
+      # Large loops (e.g. a finely divided circular hole) use a grid of
+      # cells instead of testing every pair; same result (the first crossing
+      # in the same order).
       def loops_crossing(p, q)
-        return nil if p.size * q.size > 360_000
+        return grid_crossing(p, q, false) if p.size * q.size > 360_000
         eps = (@scale * 1e-9)**2
         orient = lambda { |a, b, c| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) }
         qb = (0...q.size).map do |j|
@@ -2135,6 +2143,60 @@ module SimpleCorners
             next if bb[1] < x0 || bb[0] > x1 || bb[3] < y0 || bb[2] > y1
             c = q[j]
             d = q[(j + 1) % q.size]
+            d1 = orient.call(c, d, a)
+            d2 = orient.call(c, d, b)
+            next unless d1 * d2 < -eps
+            d3 = orient.call(a, b, c)
+            d4 = orient.call(a, b, d)
+            return [i, j] if d3 * d4 < -eps
+          end
+        end
+        nil
+      end
+
+      # The first pair [i, j] (by i, then j) of crossing segments of closed
+      # 2D polygons p and q (same: of p itself, j >= i + 2, not the first
+      # and last segment), as the pairwise loops find it, or nil. The
+      # segments of q are put in the cells of a grid their boxes overlap;
+      # two crossing segments share the cell of their crossing point.
+      def grid_crossing(p, q, same)
+        n = p.size
+        m = q.size
+        eps = (@scale * 1e-9)**2
+        orient = lambda { |a, b, c| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) }
+        all = p + (same ? [] : q)
+        x0, x1 = all.map { |a| a[0] }.minmax
+        y0, y1 = all.map { |a| a[1] }.minmax
+        w = x1 - x0
+        h = y1 - y0
+        return nil unless w > 0 || h > 0
+        # about one cell per segment, at most 1024 along each side
+        side = Math.sqrt([w * h, (w + h)**2 * 1e-6].max / [n, m].max)
+        side = [side, w / 1024.0, h / 1024.0].max
+        cols = [(w / side).floor + 1, 1025].min
+        rows = [(h / side).floor + 1, 1025].min
+        cell = lambda do |x, y|
+          [[[((x - x0) / side).floor, 0].max, cols - 1].min, [[((y - y0) / side).floor, 0].max, rows - 1].min]
+        end
+        grid = {}
+        m.times do |j|
+          c = q[j]
+          d = q[(j + 1) % m]
+          ca, ra = cell.call([c[0], d[0]].min, [c[1], d[1]].min)
+          cb, rb = cell.call([c[0], d[0]].max, [c[1], d[1]].max)
+          (ca..cb).each { |cx| (ra..rb).each { |ry| (grid[cx * rows + ry] ||= []) << j } }
+        end
+        n.times do |i|
+          a = p[i]
+          b = p[(i + 1) % n]
+          ca, ra = cell.call([a[0], b[0]].min, [a[1], b[1]].min)
+          cb, rb = cell.call([a[0], b[0]].max, [a[1], b[1]].max)
+          cand = {}
+          (ca..cb).each { |cx| (ra..rb).each { |ry| (grid[cx * rows + ry] || []).each { |j| cand[j] = true } } }
+          cand.keys.sort.each do |j|
+            next if same && (j < i + 2 || (i == 0 && j == n - 1))
+            c = q[j]
+            d = q[(j + 1) % m]
             d1 = orient.call(c, d, a)
             d2 = orient.call(c, d, b)
             next unless d1 * d2 < -eps
@@ -2194,7 +2256,8 @@ module SimpleCorners
       # Indices of two crossing segments of a closed 2D polygon, or nil.
       def self_crossing(p)
         n = p.size
-        return nil if n < 4 || n > 600
+        return nil if n < 4
+        return grid_crossing(p, p, true) if n > 600
         eps = (@scale * 1e-9)**2
         orient = lambda { |a, b, c| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) }
         n.times do |i|

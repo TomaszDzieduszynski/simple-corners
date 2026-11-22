@@ -6,7 +6,7 @@ faces with holes.
 
 ## [⬇ Download Simple Corners (simple_corners.rbz)](https://github.com/TomaszDzieduszynski/simple-corners/releases/latest/download/simple_corners.rbz)
 
-Version 1.2.3 · SketchUp 2017 or newer · Windows and Mac · free and open
+Version 1.2.4 · SketchUp 2017 or newer · Windows and Mac · free and open
 source · signed by SketchUp's extension signing service
 
 ![The three tools on the same L-shaped block](docs/images/tools.png)
@@ -80,13 +80,18 @@ do.
   never hit this.
 - **Groups and components:** select them and the whole object is processed.
   All copies of a component change together, because they share one
-  definition.
+  definition. The radius is measured in the model, also in scaled or
+  stretched groups: 1" is 1" in every direction. For stretched (oval)
+  rounds, round first, then scale. Copies of a component scaled
+  differently from each other can only match the one you selected.
+  Locked groups and components are left as they are.
 - **Revert to sharp edge:** click a rounded or bevelled surface (one click
   selects a whole smooth surface; Shift+click adds more) and press the
   button. Select a whole rounded solid to make it sharp again, or only some
   fillets: those edges become sharp and the rest stays rounded as it was.
   It is experimental, so check the result (Ctrl+Z undoes it). A surface it
-  does not recognise is left unchanged, with a message.
+  does not recognise is left unchanged, with a message. In a group stretched
+  unevenly after rounding, revert the whole surface (part of it is refused).
 - **Very small models:** SketchUp cannot make edges shorter than about
   0.001". If a tiny radius fails, scale the model up (x10 or x100), apply,
   then scale it back down.

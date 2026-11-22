@@ -19,9 +19,13 @@ module SimpleCorners
 
     # Runs the engine on edges without changing the model.
     # Returns [engine, faces, vertices] (raises Core::Error).
+    # opts[:space]: a Space when the edges are inside a scaled group or
+    # component; the engine then works in model units (its points are model
+    # coordinates; Space#to_local brings them back).
     def self.compute(edges, opts)
       edges = edges.select { |e| e.valid? && e.is_a?(Sketchup::Edge) }.uniq
       raise Core::Error, 'No edge selected.' if edges.empty?
+      space = opts[:space]
 
       vmap = {}
       verts = []
@@ -32,7 +36,7 @@ module SimpleCorners
           id = verts.size
           vmap[vx] = id
           verts << vx
-          pts << vx.position.to_a
+          pts << (space ? space.to_model(vx.position.to_a) : vx.position.to_a)
         end
         id
       end
@@ -43,7 +47,7 @@ module SimpleCorners
         outer = f.outer_loop
         loops = [outer] + f.loops.reject(&:outer?)
         { :loops => loops.map { |lp| lp.vertices.map { |vx| vid.call(vx) } },
-          :normal => f.normal.to_a }
+          :normal => space ? space.normal(f.normal.to_a) : f.normal.to_a }
       end
       sel = edges.map { |e| [vid.call(e.start), vid.call(e.end)] }
       # Given radius per edge ({Sketchup::Edge => offset}, e.g. rounding
@@ -62,7 +66,10 @@ module SimpleCorners
 
       fmt = lambda { |x| Sketchup.format_length(x) }
       # Fits the radius: smaller only at the corners where it does not fit.
-      eng = Core::Engine.fit(pts, fdata, sel, opts.merge(:format => fmt, :merge_dist => MIN_DIST))
+      # Points closer than MIN_DIST inside the group must merge: in model
+      # units that is up to MIN_DIST times the largest scale.
+      merge = space ? MIN_DIST * space.max_scale : MIN_DIST
+      eng = Core::Engine.fit(pts, fdata, sel, opts.merge(:format => fmt, :merge_dist => merge))
       [eng, faces, verts]
     end
 
@@ -91,8 +98,18 @@ module SimpleCorners
     # changes. Component definitions are shared on purpose: each is
     # processed once (done: definitions already processed) and every
     # instance of it changes.
-    def self.process_instance(inst, opts, done = {}, depth = 0)
+    # tr: the instance's placement in the model (its transformation times
+    # those of the instances holding it); the radius is measured in the
+    # model, also in a scaled or stretched group.
+    # Sets done[:processed] when a level had edges to round; the caller
+    # reports a selection with nothing to round once, after all of it.
+    # Locked instances (nested ones too) are left as they are: done[:locked].
+    def self.process_instance(inst, opts, done = {}, depth = 0, tr = inst.transformation)
       return [] if depth > MAX_DEPTH
+      if locked?(inst)
+        done[:locked] = true
+        return []
+      end
       if inst.is_a?(Sketchup::Group)
         inst.make_unique if inst.definition.instances.size > 1
       else
@@ -106,18 +123,135 @@ module SimpleCorners
       # objects) is passed over, so its nested objects still get done.
       warnings = []
       if edges.any? { |e| usable_edge?(e) }
-        warnings = process(ents, edges, opts)
+        warnings = process(ents, edges, opts.merge(:space => Space.for(tr), :metric => metric(tr)))
         done[:processed] = true
       end
       nested = ents.to_a.select { |e| e.valid? && (e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)) }
       nested.each do |e|
-        sub = opts.merge(:offset => opts[:offset] / SimpleCorners.scale_of(e.transformation))
-        warnings.concat(process_instance(e, sub, done, depth + 1))
-      end
-      if depth == 0 && !done[:processed]
-        raise Core::Error, 'No edge can be processed. Edges must border exactly two non-coplanar faces.'
+        warnings.concat(process_instance(e, opts, done, depth + 1, tr * e.transformation))
       end
       warnings
+    end
+
+    # How a placement scales lengths, independent of moving, rotating and
+    # mirroring: the 6 numbers of M^T M (M: its scaling part). Stored with
+    # the radius on new faces, so a later change of the group's scale can
+    # be recognised (Revert then measures instead of trusting the number).
+    def self.metric(tr)
+      return [1.0, 0.0, 0.0, 1.0, 0.0, 1.0] unless tr
+      a = tr.to_a.map(&:to_f)
+      w = a[15].abs > 1e-12 ? a[15] : 1.0
+      c = [[a[0], a[1], a[2]], [a[4], a[5], a[6]], [a[8], a[9], a[10]]].map { |v| v.map { |x| x / w } }
+      g = lambda { |i, j| c[i][0] * c[j][0] + c[i][1] * c[j][1] + c[i][2] * c[j][2] }
+      [g.call(0, 0), g.call(0, 1), g.call(0, 2), g.call(1, 1), g.call(1, 2), g.call(2, 2)]
+    end
+
+    def self.same_metric?(a, b)
+      return false unless a.is_a?(Array) && b.is_a?(Array) && a.size == 6 && b.size == 6
+      big = (a + b).map { |x| x.to_f.abs }.max
+      a.zip(b).all? { |x, y| (x.to_f - y.to_f).abs <= 1e-6 * big }
+    end
+
+    # b is a uniformly scaled a (lengths changed by the same factor in every
+    # direction, or not at all).
+    def self.uniform_change?(a, b)
+      return false unless a.is_a?(Array) && b.is_a?(Array) && a.size == 6 && b.size == 6
+      ta = a[0].to_f + a[3].to_f + a[5].to_f
+      tb = b[0].to_f + b[3].to_f + b[5].to_f
+      return false unless ta > 0 && tb > 0
+      same_metric?(a.map { |x| x.to_f * tb / ta }, b)
+    end
+
+    # Scale of the coordinates the API reports in the open context: those
+    # of the open group or component (SketchUp reports model coordinates
+    # there), or of the model.
+    def self.context_metric(model)
+      path = model.active_path
+      return metric(nil) unless path && !path.empty? && model.respond_to?(:edit_transform)
+      metric(model.edit_transform)
+    end
+
+    NOTHING_TO_ROUND = 'No edge can be processed. Edges must border exactly two non-coplanar faces.'.freeze
+    LOCKED = 'the group or component is locked. Unlock it first (right-click > Unlock).'.freeze
+    LOCKED_SKIPPED = 'Locked groups and components were left unchanged.'.freeze
+
+    # Locked groups and components: SketchUp's own tools leave them alone
+    # (its Ruby API would not stop an edit).
+    def self.locked?(e)
+      e.respond_to?(:locked?) && e.locked? ? true : false
+    end
+
+    # The coordinates of a scaled or stretched group or component, so the
+    # engine can work in model units: a radius of 1" is then 1" in the
+    # model in every direction (a true circle as seen in the model, even in
+    # a group stretched along one axis). Scaling, stretching, shearing,
+    # rotation and mirroring keep faces flat and edges straight, so the
+    # result brought back into the group is valid geometry.
+    # Only the scaling part of the placement is applied, not its position:
+    # the numbers stay as small as the group's own (a group far from the
+    # origin would otherwise lose precision in the engine).
+    class Space
+      # nil when the group is not scaled (only moved, rotated or mirrored):
+      # its own units are then model units.
+      def self.for(tr)
+        return nil unless tr
+        sp = new(tr)
+        sp.isometry? ? nil : sp
+      end
+
+      def initialize(tr)
+        a = tr.to_a.map(&:to_f)
+        # SketchUp may keep a uniform scale in the last element.
+        w = a[15].abs > 1e-12 ? a[15] : 1.0
+        @m = [[a[0], a[4], a[8]], [a[1], a[5], a[9]], [a[2], a[6], a[10]]].map { |r| r.map { |x| x / w } }
+        m = @m
+        cof = [[m[1][1] * m[2][2] - m[1][2] * m[2][1], m[1][2] * m[2][0] - m[1][0] * m[2][2], m[1][0] * m[2][1] - m[1][1] * m[2][0]],
+               [m[0][2] * m[2][1] - m[0][1] * m[2][2], m[0][0] * m[2][2] - m[0][2] * m[2][0], m[0][1] * m[2][0] - m[0][0] * m[2][1]],
+               [m[0][1] * m[1][2] - m[0][2] * m[1][1], m[0][2] * m[1][0] - m[0][0] * m[1][2], m[0][0] * m[1][1] - m[0][1] * m[1][0]]]
+        det = m[0][0] * cof[0][0] + m[0][1] * cof[0][1] + m[0][2] * cof[0][2]
+        # flat (zero size in some direction), relative to the axes' lengths,
+        # so a valid but very small or very large scale is accepted
+        cols = (0..2).map { |j| Math.sqrt(m[0][j]**2 + m[1][j]**2 + m[2][j]**2) }
+        if det.abs <= 1e-12 * cols.inject(:*) || det.zero?
+          raise Error, 'the group or component is scaled to zero size.'
+        end
+        # inverse = transposed cofactors / det; normals go through the
+        # inverse transposed (cofactors / det)
+        @inv = (0..2).map { |i| (0..2).map { |j| cof[j][i] / det } }
+        @nrm = cof.map { |r| r.map { |x| x / det } }
+      end
+
+      # Group coordinates -> engine coordinates (model units, group origin).
+      def to_model(p)
+        m = @m
+        (0..2).map { |i| m[i][0] * p[0] + m[i][1] * p[1] + m[i][2] * p[2] }
+      end
+
+      def to_local(q)
+        (0..2).map { |i| @inv[i][0] * q[0] + @inv[i][1] * q[1] + @inv[i][2] * q[2] }
+      end
+
+      # Normal of a face in model space (unit length).
+      def normal(n)
+        v = (0..2).map { |i| @nrm[i][0] * n[0] + @nrm[i][1] * n[1] + @nrm[i][2] * n[2] }
+        len = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+        len > 0 ? v.map { |x| x / len } : n
+      end
+
+      # Largest length an inch of the group's axes has in the model.
+      def max_scale
+        (0..2).map { |j| Math.sqrt(@m[0][j]**2 + @m[1][j]**2 + @m[2][j]**2) }.max
+      end
+
+      # Lengths unchanged (moved, rotated or mirrored only).
+      def isometry?
+        (0..2).all? do |i|
+          (0..2).all? do |j|
+            d = @m[0][i] * @m[0][j] + @m[1][i] * @m[1][j] + @m[2][i] * @m[2][j]
+            (d - (i == j ? 1.0 : 0.0)).abs < 1e-9
+          end
+        end
+      end
     end
 
     # An edge the engine can round: between two faces that are not
@@ -133,12 +267,17 @@ module SimpleCorners
     DICT = 'SimpleCorners'.freeze
 
     def self.apply(ents, eng, faces, verts, opts = {})
-      pts = eng.points
+      # The engine worked in model units in a scaled group: back to the
+      # group's own coordinates.
+      space = opts[:space]
+      pts = space ? eng.points.map { |p| space.to_local(p) } : eng.points
       gp = welder(pts, verts)
 
       # Remember what must survive the rebuild.
       fattr = {}
       eng.face_loops.each_key { |fi| fattr[fi] = face_attrs(faces[fi]) }
+      ident = {}
+      eng.face_loops.each_key { |fi| ident[fi] = identity_of(faces[fi]) }
       eng.new_polys.each { |p| fattr[p[:src]] ||= face_attrs(faces[p[:src]]) }
       old_edges = eng.face_loops.keys.flat_map { |fi| faces[fi].edges }.uniq
       removed = eng.removed_edges.map { |a, b| verts[a].common_edge(verts[b]) }.compact.uniq
@@ -169,6 +308,8 @@ module SimpleCorners
         f = add_face_loops(te, loops.map { |lp| lp.map(&gp) }) do |x|
           x.reverse! if x.normal.dot(Geom::Vector3d.new(*fattr[fi][:normal])) < 0
           apply_face_attrs(x, fattr[fi])
+          # the trimmed face stays the same face (new faces do not get this)
+          give_identity(x, ident[fi])
         end
         failed += 1 unless f
       end
@@ -188,6 +329,8 @@ module SimpleCorners
           f.set_attribute(DICT, 'op', opts[:op_id])
           f.set_attribute(DICT, 'mode', opts[:mode].to_s)
           f.set_attribute(DICT, 'radius', opts[:offset].to_f)
+          # the scale that radius was measured in (see metric)
+          f.set_attribute(DICT, 'metric', opts[:metric]) if opts[:metric]
           f.set_attribute(DICT, 'segments', opts[:segments].to_i) if opts[:segments]
           f.set_attribute(DICT, 'smooth', opts[:smooth] != false)
         end
@@ -208,9 +351,9 @@ module SimpleCorners
       ents.erase_entities(to_erase.select(&:valid?))
       drop_stray_edges(old_edges, te)
       guard.erase! if guard.valid?
-      created = (tmp.explode || []).grep(Sketchup::Face)
+      created = explode_new(tmp)
 
-      finish_edges(created, eng, trim_info, opts[:smooth] != false)
+      finish_edges(created, eng, trim_info, opts[:smooth] != false, pts)
       old_edges.each { |e| e.erase! if e.valid? && e.faces.empty? }
       check_closed(created, open_before)
     end
@@ -510,6 +653,52 @@ module SimpleCorners
       f.layer = h[:layer] if h[:layer]
     end
 
+    # What keeps a trimmed face the same face for the user and for other
+    # extensions: hidden or not, and its attribute dictionaries (with any
+    # dictionaries nested in them). Only the face that replaces it gets
+    # these, never the new faces of a rounding.
+    def self.identity_of(f)
+      { :hidden => f.hidden?, :dicts => dict_tree(f) }
+    end
+
+    def self.give_identity(f, h)
+      return unless h
+      f.hidden = true if h[:hidden]
+      put_dicts(f, h[:dicts])
+    end
+
+    def self.dict_tree(ent)
+      ds = ent.respond_to?(:attribute_dictionaries) ? ent.attribute_dictionaries : nil
+      return [] unless ds
+      ds.map do |d|
+        pairs = []
+        d.each_pair { |k, v| pairs << [k, v] }
+        [d.name, pairs, dict_tree(d)]
+      end
+    end
+
+    def self.put_dicts(ent, tree)
+      tree.each do |name, pairs, kids|
+        d = ent.attribute_dictionary(name, true)
+        pairs.each { |k, v| d[k] = v }
+        put_dicts(d, kids)
+      end
+    end
+
+    # Explodes the temporary group holding the new faces; returns the new
+    # faces. If SketchUp cannot explode it, the group is still there: the
+    # error makes the caller abort the operation, so the model goes back
+    # to how it was instead of keeping half a rebuild. (Checked by the
+    # group still existing, not only by the result, which SketchUp gives
+    # as false.)
+    def self.explode_new(tmp)
+      res = tmp.explode
+      if tmp.valid? || !res.respond_to?(:grep)
+        raise Error, 'SketchUp could not place the new faces in the model (exploding their temporary group failed).'
+      end
+      res.grep(Sketchup::Face)
+    end
+
     def self.edge_attrs(e)
       { :soft => e.soft?, :smooth => e.smooth?, :hidden => e.hidden?,
         :material => e.material, :layer => e.layer }
@@ -524,12 +713,12 @@ module SimpleCorners
     # of trimmed edges their original properties.
     # smooth false: the segment lines of rounded surfaces stay visible (only
     # the diagonals of split quads are softened).
-    def self.finish_edges(created, eng, trim_info, smooth = true)
+    def self.finish_edges(created, eng, trim_info, smooth = true, pts = eng.points)
       softset = smooth ? eng.soft : eng.diagonals
       ids = {}
       softset.each_key do |a, b|
-        ids[pkey(eng.points[a])] = a
-        ids[pkey(eng.points[b])] = b
+        ids[pkey(pts[a])] = a
+        ids[pkey(pts[b])] = b
       end
       seen = {}
       created.each do |f|
