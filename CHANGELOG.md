@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.5
+
+- Zoomed in close on SketchUp 2017 to 2024, the dots marking the selected
+  edges could appear far from where they belong (corners behind the
+  camera were mirrored onto the screen). They are no longer drawn.
+
 ## 1.2.4
 
 - Groups and components scaled unevenly (e.g. stretched along one axis)

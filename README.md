@@ -6,7 +6,7 @@ faces with holes.
 
 ## [⬇ Download Simple Corners (simple_corners.rbz)](https://github.com/TomaszDzieduszynski/simple-corners/releases/latest/download/simple_corners.rbz)
 
-Version 1.2.4 · SketchUp 2017 or newer · Windows and Mac · free and open
+Version 1.2.5 · SketchUp 2017 or newer · Windows and Mac · free and open
 source · signed by SketchUp's extension signing service
 
 ![The three tools on the same L-shaped block](docs/images/tools.png)

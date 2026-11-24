@@ -261,7 +261,8 @@ module SimpleCorners
         end
         draw_lines(view, pv[:sel], SEL_COLOR, 5)
         draw_lines(view, pv[:boxes], SEL_COLOR, 4)
-        view.draw_points(lifted(pv[:ends]), 7, 2, SEL_COLOR) unless pv[:ends].empty?
+        ends = in_front(pv[:ends])
+        view.draw_points(lifted(ends), 7, 2, SEL_COLOR) unless ends.empty?
         unless pv[:error]
           draw_lines(view, pv[:soft], SOFT_COLOR, 1)
           draw_lines(view, pv[:hard], HARD_COLOR, 2)
@@ -272,7 +273,8 @@ module SimpleCorners
         view.line_stipple = '-'
         draw_lines(view, [@p1, @ip.position], HARD_COLOR, 2)
         view.line_stipple = ''
-        view.draw_points(lifted([@p1]), 8, 2, HARD_COLOR)
+        p1 = in_front([@p1])
+        view.draw_points(lifted(p1), 8, 2, HARD_COLOR) unless p1.empty?
       end
       @ip.draw(view) if @ip && @ip.valid? && @ip.display?
     end
@@ -459,6 +461,17 @@ module SimpleCorners
         end
         p.offset(v)
       end
+    end
+
+    # Points behind the camera (zoomed in close): the graphics engine before
+    # SketchUp 2025 does not clip them in draw_points but mirrors them onto
+    # the screen, far from where they belong. Lines are clipped correctly.
+    def in_front(pts)
+      l = @lift
+      return pts unless l && l[:persp]
+      eye = l[:eye]
+      dir = l[:dir]
+      pts.select { |p| eye.vector_to(p).dot(dir) > 0 }
     end
 
     def draw_hover(view)

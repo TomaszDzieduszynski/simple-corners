@@ -384,6 +384,27 @@ class TestBridge < Minitest::Test
     end
   end
 
+  # Zoomed in close, some edge ends are behind the camera. SketchUp before
+  # 2025 mirrors such points onto the screen, so they are not drawn.
+  def test_end_dots_behind_the_camera_are_not_drawn
+    model.selection.add(build(M.box))
+    tool = new_tool(:round)
+    eye = pt(5, 5, 5) # inside the 10" box, looking along +x
+    target = pt(10, 5, 5)
+    persp = true
+    @view.define_singleton_method(:camera) { Sketchup::Camera.new(eye, target, persp) }
+    dots = []
+    @view.define_singleton_method(:draw_points) { |pts, *_a| dots.concat(pts) }
+    tool.draw(@view)
+    refute_empty dots
+    assert(dots.all? { |q| q.x > 5 }, 'a dot behind the camera was drawn')
+    assert_equal 4, dots.map { |q| [q.x.round(2), q.y.round, q.z.round] }.uniq.size
+    persp = false # parallel projection: nothing to mirror, all are drawn
+    dots.clear
+    tool.draw(@view)
+    assert_equal 8, dots.map { |q| [q.x.round(2), q.y.round, q.z.round] }.uniq.size
+  end
+
   # Very heavy jobs (here 64 segments on a whole box) ask first; "No"
   # leaves the model untouched.
   def test_heavy_job_asks_first
